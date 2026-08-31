@@ -1,0 +1,51 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --------------------------------------------------------------------------- #
+# User data
+#
+# The app no longer writes into the repo. Everything a user accumulates lives in
+# their profile database under %LOCALAPPDATA%\ManagerWorkbench (or
+# $MANAGER_WORKBENCH_HOME) — see user_profile.py.
+#
+# These entries cover the pre-migration layout, which is left on disk as
+# *.migrated after the one-time import, so live data can never be committed.
+# saydo_tasks.json / checkpoints.json are still listed: the modules that wrote
+# them are gone, but an old checkout may still have the files.
+# --------------------------------------------------------------------------- #
+*.migrated
+app_config.json
+app_config.json.bak
+app_config.json.corrupt-*
+email_actions.json
+saydo_tasks.json
+checkpoints.json
+ooo_settings.json
+one_on_one_meetings.json
+manager_one_on_one.json
+manager_manual_topics.json
+special_projects.json
+jira_state_cache.json
+*.db
+*.db-wal
+*.db-shm
+*.mwb
+
+# --------------------------------------------------------------------------- #
+# Secrets — never commit these
+# --------------------------------------------------------------------------- #
+ms_token_cache.bin
+ms_client_secret.txt
+MS_Client_Secret.txt
+machine.json
+Jira_PAT.txt
+Confluence_PAT.txt
+its-compute-emc-zaip-p-*.json
+backlog.md
+
+PROJECT_IMPLEMENTATION_PLAN.md
+# Backup of the nested pages/ clone (ECRT_ManagerAgent_1.0) taken when its
+# history was discarded and pages/*.py were absorbed as plain files.
+pages-git-backup-*.tar.gz
