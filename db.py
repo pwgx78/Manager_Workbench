@@ -105,10 +105,12 @@ def init_schema():
     import email_db
     import jira_db
     import one_on_one_db
+    import project_db
 
     email_db.init_db()
     jira_db.init_db()
     one_on_one_db.init_db()
+    project_db.init_db()
 
     if get_meta("schema_version") is None:
         set_meta("schema_version", str(SCHEMA_VERSION))

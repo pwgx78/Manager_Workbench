@@ -147,6 +147,9 @@ with st.sidebar:
     st.caption("Human-in-the-Loop: the agent drafts; you approve & send.")
 
 pages = {
+    "📁 Project Management": [
+        st.Page("pages/2_project_management.py", title="Project Register", icon="📁"),
+    ],
     "👤 Individual Execution": [
         st.Page("pages/0_email_actions.py", title="Email Action Identifier", icon="📥"),
         st.Page("pages/3_exec_translator.py", title="Executive Translator", icon="🎯"),

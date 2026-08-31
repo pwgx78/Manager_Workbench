@@ -295,6 +295,43 @@ Return a SINGLE valid JSON object: {{"status": "<one-line status>"}}.
 """
 
 
+def build_project_description_prompt(name, keywords="", linked_block="", team_context=""):
+    """Describe one PROJECT from the register, in two or three sentences.
+
+    Generated ON DEMAND only, never automatically — this is the sole LLM cost in
+    the project feature, so it stays behind an explicit button. `linked_block` is
+    whatever is already linked (email subjects, Jira keys), so the description is
+    grounded in real work rather than invented from the name alone.
+    """
+    keyword_block = (
+        f"KEYWORDS the user associates with it: {keywords}\n"
+        if keywords and keywords.strip()
+        else ""
+    )
+    linked = (
+        f"\nALREADY LINKED TO THIS PROJECT (grounding — describe what these have "
+        f"in common):\n{linked_block}\n"
+        if linked_block and linked_block.strip()
+        else "\nNothing is linked to it yet, so work from the name and keywords "
+        "alone and stay general.\n"
+    )
+    return f"""
+System: You are describing a work project in the register of {config.USER_NAME},
+an ME Engineering Manager, so that it is recognizable at a glance months later.
+{_team_block(team_context)}
+PROJECT NAME: {name}
+{keyword_block}{linked}
+Write 2-3 sentences covering what the project is, why it exists, and the kind of
+work that belongs in it.
+
+RULES
+- Ground every claim in the name, keywords, or linked items above. If you cannot
+  tell something, leave it out. Do NOT invent scope, customers, dates or owners.
+- No preamble, no heading, no bullet points. Return the description text ONLY.
+- Write plainly, as the manager would. Do not open with "This project".
+"""
+
+
 def build_project_themes_prompt(project, emails_block, prior_themes=""):
     """Synthesize the common themes across one project's emails: the type of
     work being requested and whether work is repetitive vs. prior emails/themes.
