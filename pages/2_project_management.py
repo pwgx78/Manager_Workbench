@@ -142,6 +142,38 @@ with tab_register:
                 except project_db.ProjectError as exc:
                     _toast_error(exc)
 
+    # --- Create from an existing email label ------------------------------- #
+    # NOT a migration. The historical labels are deliberately left unmigrated
+    # (186 of them, 71 holding a single email); this just makes manual entry
+    # cheap for the handful that actually carry volume. Bare Jira keys are
+    # filtered out by legacy_label_counts — they are the anti-pattern.
+    with st.expander("📨 Create from an existing email label"):
+        label_rows = project_db.legacy_label_counts()
+        if not label_rows:
+            st.caption(
+                "No unregistered email labels with volume. Either the register "
+                "already covers them, or no email has been analyzed yet."
+            )
+        else:
+            st.caption(
+                f"{len(label_rows)} label(s) from analyzed email that are not in "
+                f"the register, busiest first. Creating one does NOT link its "
+                f"email — use Backfill in the project's detail pane for that."
+            )
+            for row in label_rows[:15]:
+                label_col, count_col, make_col = st.columns([5, 1, 2])
+                label_col.write(row["label"])
+                count_col.caption(f"{row['emails']} email(s)")
+                if make_col.button(
+                    "Create", key=f"fromlabel_{row['label']}"
+                ):
+                    try:
+                        made = project_db.create_project(row["label"])
+                        st.success(f"Created **{made}** from “{row['label']}”.")
+                        st.rerun()
+                    except project_db.ProjectError as exc:
+                        _toast_error(exc)
+
     col_search, col_closed = st.columns([3, 1])
     search = col_search.text_input(
         "Filter by name or keyword", placeholder="Type to narrow the register"
@@ -348,6 +380,61 @@ with tab_register:
                     width="stretch",
                     hide_index=True,
                 )
+
+        # --- Backfill by keyword ------------------------------------------ #
+        # The remedy for the one accepted consequence of never re-evaluating:
+        # a project created after an email was analyzed can never be proposed
+        # for it, because that analysis is frozen. This alias/keyword-matches
+        # the project against historical email instead. Pure string matching —
+        # no model, no re-evaluation.
+        with st.expander("⏪ Backfill from historical email"):
+            st.caption(
+                "Matches this project's name, aliases and keywords against email "
+                "already analyzed, and files the hits as proposals for you to "
+                "approve. No LLM call — this is plain string matching."
+            )
+            if st.button("Find historical matches", key=f"bf_{project_id}"):
+                st.session_state[f"bf_hits_{project_id}"] = (
+                    project_db.backfill_candidates(project_id)
+                )
+            hits = st.session_state.get(f"bf_hits_{project_id}")
+            if hits is None:
+                pass
+            elif not hits:
+                st.info(
+                    "No unlinked historical email matches this project's terms. "
+                    "Adding keywords or an alias may widen it."
+                )
+            else:
+                st.write(f"**{len(hits)}** matching email(s):")
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Received": (row["received"] or "")[:10],
+                                "Subject": row["subject"],
+                                "Legacy label": row["legacy_label"] or "—",
+                                "Matched on": ", ".join(row["matched"][:3]),
+                            }
+                            for row in hits
+                        ]
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
+                if st.button(
+                    f"Propose all {len(hits)}",
+                    type="primary",
+                    key=f"bf_apply_{project_id}",
+                ):
+                    n = project_db.backfill_link(
+                        project_id, [row["message_id"] for row in hits]
+                    )
+                    st.session_state.pop(f"bf_hits_{project_id}", None)
+                    st.success(
+                        f"Filed {n} proposal(s). Approve them in the Proposals tab."
+                    )
+                    st.rerun()
 
         # --- Lifecycle ---------------------------------------------------- #
         with st.expander("🔄 Close, reopen, merge, delete"):

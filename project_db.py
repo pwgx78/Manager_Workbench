@@ -157,6 +157,24 @@ def _normalize(text):
     return re.sub(r"[^0-9a-z]+", "", str(text or "").casefold())
 
 
+def _spaced(text):
+    """Like _normalize but keeping word boundaries, so a short term can be
+    matched with \\b anchors instead of as a bare substring."""
+    return " ".join(re.sub(r"[^0-9a-z]+", " ", str(text or "").casefold()).split())
+
+
+# A collapsed term shorter than this is matched on word boundaries rather than
+# as a substring. 'AI' inside 'chain' is the failure being avoided.
+MIN_SUBSTRING_TERM = 4
+
+# Relative weight of the thing that matched. A name hit is worth more than a
+# keyword hit, so a project named in the subject outranks one that merely shares
+# a keyword with the body.
+WEIGHT_NAME = 3.0
+WEIGHT_ALIAS = 2.0
+WEIGHT_KEYWORD = 1.0
+
+
 def _now():
     return datetime.now().isoformat(timespec="seconds")
 
@@ -750,6 +768,291 @@ def pending_proposals():
 # --------------------------------------------------------------------------- #
 # Absorbing the legacy special_projects list
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# The keyword pre-filter — pure string matching, NO model
+#
+# This is what keeps the project feature at zero extra LLM calls. Ranking rides
+# in the email-analysis prompt that already runs (P3), and this narrows the
+# active register to a shortlist first, so prompt cost stays FLAT as the register
+# grows. Without it, cost would scale linearly with project count: 40 projects x
+# 60 emails means paying for the whole roster sixty times.
+# --------------------------------------------------------------------------- #
+def _match_terms(project, aliases):
+    """(term, weight) pairs to match one project against text."""
+    terms = [(project["name"], WEIGHT_NAME)]
+    terms += [(alias, WEIGHT_ALIAS) for alias in aliases]
+    terms += [
+        (kw.strip(), WEIGHT_KEYWORD)
+        for kw in str(project.get("keywords") or "").split(",")
+        if kw.strip()
+    ]
+    return terms
+
+
+def _term_hits(term, collapsed_text, spaced_text):
+    """True when `term` appears in the text. Long terms match as a substring of
+    the collapsed form, so 'TC-101' finds 'tc101'; short ones need word
+    boundaries, so 'AI' does not fire on 'chain'."""
+    collapsed_term = _normalize(term)
+    if not collapsed_term:
+        return False
+    if len(collapsed_term) >= MIN_SUBSTRING_TERM:
+        return collapsed_term in collapsed_text
+    return re.search(rf"\b{re.escape(_spaced(term))}\b", spaced_text) is not None
+
+
+def shortlist_for_text(text, limit=8, include_scores=False):
+    """Rank ACTIVE projects against arbitrary text (an email subject + body).
+
+    Pure SQL and string matching — no model is called, so this is free and can
+    run on every email. Closed projects are excluded, which is the whole reason
+    close_date exists: dead work stops being offered.
+
+    Returns the top `limit` projects, best first. With include_scores=True each
+    dict carries `_score` and `_matched` (the terms that fired), which is what
+    the UI shows so a shortlist is explainable rather than magic.
+    """
+    haystack = str(text or "")
+    if not haystack.strip():
+        return []
+    collapsed_text = _normalize(haystack)
+    spaced_text = _spaced(haystack)
+
+    conn = db.connect()
+    rows = conn.execute(
+        f"SELECT {', '.join(PROJECT_COLUMNS)} FROM projects WHERE status = 'active'"
+    ).fetchall()
+    alias_rows = conn.execute(
+        "SELECT project_id, IFNULL(display, alias) FROM project_aliases"
+    ).fetchall()
+    conn.close()
+
+    aliases_by_project = {}
+    for project_id, alias in alias_rows:
+        aliases_by_project.setdefault(project_id, []).append(alias)
+
+    scored = []
+    for row in rows:
+        project = _row_to_dict(row, PROJECT_COLUMNS)
+        score, matched = 0.0, []
+        for term, weight in _match_terms(
+            project, aliases_by_project.get(project["project_id"], [])
+        ):
+            if _term_hits(term, collapsed_text, spaced_text):
+                score += weight
+                matched.append(term)
+        if score > 0:
+            if include_scores:
+                project["_score"] = score
+                project["_matched"] = matched
+            scored.append((score, project["name"], project))
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [project for _score, _name, project in scored[:limit]]
+
+
+def candidate_block(projects):
+    """Render a shortlist as prompt text. Lives here rather than in llm_prompts
+    so the id/name/keyword shape is defined next to the schema that produces it.
+    Consumed by the email-analysis prompt in P3."""
+    lines = []
+    for project in projects:
+        keywords = str(project.get("keywords") or "").strip()
+        line = f"- {project['project_id']}: {project['name']}"
+        if keywords:
+            line += f" (keywords: {keywords})"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# Entity-side reads — "what projects does this email belong to"
+# --------------------------------------------------------------------------- #
+def projects_for_entity(entity_type, entity_id, states=("confirmed",)):
+    """Full project rows linked to one entity, with the link state attached.
+
+    Returns a LIST, not a single value: an email may sit in up to three
+    projects, which is exactly what email_projects.message_id being a PRIMARY
+    KEY cannot express."""
+    if not entity_id:
+        return []
+    placeholders = ", ".join("?" for _ in states)
+    conn = db.connect()
+    rows = conn.execute(
+        f"""
+        SELECT {', '.join('p.' + c for c in PROJECT_COLUMNS)}, l.state, l.confidence
+        FROM project_links l JOIN projects p ON p.project_id = l.project_id
+        WHERE l.entity_type = ? AND l.entity_id = ? AND l.state IN ({placeholders})
+        ORDER BY p.name
+        """,
+        [entity_type, str(entity_id), *states],
+    ).fetchall()
+    conn.close()
+    columns = (*PROJECT_COLUMNS, "link_state", "link_confidence")
+    return [_row_to_dict(r, columns) for r in rows]
+
+
+def entity_ids_for_project(project_id, entity_type, states=("confirmed",)):
+    """The entity ids of one type linked to a project."""
+    placeholders = ", ".join("?" for _ in states)
+    conn = db.connect()
+    rows = conn.execute(
+        f"SELECT entity_id FROM project_links WHERE project_id = ? "
+        f"AND entity_type = ? AND state IN ({placeholders})",
+        [project_id, entity_type, *states],
+    ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def link_legacy_label(label, entity_type, entity_id):
+    """Link an entity to whatever project its legacy free-text label resolves to.
+
+    The dual-write path for already-analyzed email (plan 6.3: the legacy label
+    keeps being written and is a free, strong signal). Confirmed rather than
+    proposed on purpose: this is a deterministic name/alias identity, not a model
+    judgement — 'AI Gov' IS project FAB-001. LLM ranking, which is a judgement,
+    still arrives as a proposal in P3.
+
+    Returns the project_id linked, or None if the label matches nothing.
+    """
+    if not label or str(label).strip().lower() == "unassigned":
+        return None
+    project_id = resolve_name(label)
+    if not project_id:
+        return None
+    project = get_project(project_id)
+    if not project or project["status"] != "active":
+        return None
+    try:
+        link(
+            project_id,
+            entity_type,
+            entity_id,
+            state="confirmed",
+            confidence=1.0,
+            rationale=f"Legacy label {label!r} matches this project exactly.",
+            assigned_by="auto",
+        )
+    except ProjectError:
+        # The cap is already full, or the row is otherwise refused. Not fatal:
+        # the legacy label is still written by the caller either way.
+        return None
+    return project_id
+
+
+# --------------------------------------------------------------------------- #
+# Backfill by keyword — the remedy for the one accepted consequence
+#
+# Analyses are never recomputed (decision 10), so a project created AFTER an
+# email was analyzed can never appear as a proposal for it: already-analyzed mail
+# is frozen. This is the agreed way out — alias/keyword-match a new project
+# against historical email and offer the hits as proposals. Pure string
+# matching, no model, no re-evaluation.
+#
+# These read email_projects directly. Reaching across to another module's table
+# for a read is the point of decision 1 (one database, separate modules): a join
+# like this is impossible across ATTACHed files.
+# --------------------------------------------------------------------------- #
+def backfill_candidates(project_id, limit=200):
+    """Historical emails that match a project's name, aliases or keywords and
+    are not already linked to it. Newest first."""
+    project = get_project(project_id)
+    if not project:
+        return []
+    terms = _match_terms(project, list_aliases(project_id))
+    if not terms:
+        return []
+    linked = set(entity_ids_for_project(project_id, "email", states=STATES))
+
+    conn = db.connect()
+    rows = conn.execute(
+        "SELECT message_id, subject, received, summary, project FROM email_projects "
+        "ORDER BY received DESC"
+    ).fetchall()
+    conn.close()
+
+    hits = []
+    for message_id, subject, received, summary, legacy_label in rows:
+        if message_id in linked:
+            continue
+        haystack = " ".join(str(x or "") for x in (subject, summary, legacy_label))
+        collapsed, spaced = _normalize(haystack), _spaced(haystack)
+        matched = [
+            term for term, _weight in terms if _term_hits(term, collapsed, spaced)
+        ]
+        if matched:
+            hits.append(
+                {
+                    "message_id": message_id,
+                    "subject": subject,
+                    "received": received,
+                    "legacy_label": legacy_label,
+                    "matched": matched,
+                }
+            )
+        if len(hits) >= limit:
+            break
+    return hits
+
+
+def backfill_link(project_id, message_ids, state="proposed"):
+    """Link a batch of historical emails to a project. Defaults to `proposed`,
+    not `confirmed`: a keyword hit is a suggestion, unlike the exact label
+    identity that link_legacy_label handles."""
+    linked = 0
+    for message_id in message_ids:
+        try:
+            link(
+                project_id,
+                "email",
+                message_id,
+                state=state,
+                rationale="Keyword backfill against historical email.",
+                assigned_by="auto",
+            )
+            linked += 1
+        except ProjectError:
+            continue
+    return linked
+
+
+def legacy_label_counts(limit=40, exclude_registered=True):
+    """Top legacy free-text email labels by count, for the 'create from existing
+    label' shortcut. NOT a migration — it just makes manual entry cheap for the
+    labels that actually carry volume.
+
+    Jira-key-shaped labels are dropped: about 21 of them exist, and they are
+    precisely the anti-pattern this register refuses. 'Unassigned' is dropped
+    too, being the absence of a label rather than one.
+    """
+    conn = db.connect()
+    rows = conn.execute(
+        "SELECT project, COUNT(*) FROM email_projects "
+        "WHERE project IS NOT NULL AND TRIM(project) != '' "
+        "AND project != 'Unassigned' "
+        "GROUP BY project ORDER BY COUNT(*) DESC, project"
+    ).fetchall()
+    conn.close()
+
+    out = []
+    for label, total in rows:
+        # A label that IS a bare Jira issue key, e.g. 'SPR-60789'. A descriptive
+        # label that merely mentions one ('SPR-61086 TC53e Trigger Issue') is
+        # kept: that names real work.
+        if re.fullmatch(r"[A-Za-z]{2,6}-\d+", str(label).strip()):
+            continue
+        registered = resolve_name(label)
+        if exclude_registered and registered:
+            continue
+        out.append(
+            {"label": label, "emails": int(total), "project_id": registered}
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
 def has_absorbed_special_projects():
     """True once the legacy list has been imported for this profile."""
     return bool(db.get_meta(ABSORBED_KEY))

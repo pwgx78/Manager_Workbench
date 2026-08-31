@@ -20,6 +20,7 @@ import config
 import store
 import email_db
 import llm_prompts as P
+import project_db
 from api_helpers import fetch_recent_inbox, clean_html, fetch_carrier_tracking_text
 
 st.header("📥 Email Action Identifier")
@@ -129,6 +130,118 @@ def _add_to_tracker(task):
         }
     )
     store.save_json(config.EMAIL_ACTIONS_KEY, actions)
+
+
+def _project_links_for_messages(message_ids):
+    """Project ids confirmed on ANY message of a conversation, and the count of
+    messages each covers. A conversation is not itself the unit of linking here —
+    links are per email, matching the dual-write — so partial coverage is real
+    and worth showing rather than hiding."""
+    coverage = {}
+    for message_id in message_ids:
+        for project in project_db.projects_for_entity("email", message_id):
+            coverage[project["project_id"]] = coverage.get(project["project_id"], 0) + 1
+    return coverage
+
+
+def _render_project_controls(conv_id, subject, summary_text, message_ids):
+    """Manual project linking for one conversation.
+
+    Applies to every message in the thread, like the disposition control above
+    it, and writes 'email' links so these counts are directly comparable with
+    the ones the analyzer's dual-write produces.
+
+    Candidates come from the keyword pre-filter — pure string matching, no model
+    call — so this costs nothing to render. The LLM starts ranking candidates in
+    P3; until then this is how email gets into the register.
+    """
+    if not message_ids:
+        return
+    coverage = _project_links_for_messages(message_ids)
+    total = len(message_ids)
+
+    st.markdown("**Projects**")
+    if coverage:
+        st.caption(
+            " · ".join(
+                f"`{pid}` ({n}/{total} email{'s' if n != 1 else ''})"
+                for pid, n in sorted(coverage.items())
+            )
+        )
+    else:
+        st.caption("Not linked to any project yet.")
+
+    shortlist = project_db.shortlist_for_text(
+        f"{subject}\n{summary_text}", include_scores=True
+    )
+    active = project_db.list_projects()
+    labels = {f"{p['project_id']} — {p['name']}": p["project_id"] for p in active}
+    if shortlist:
+        st.caption(
+            "Suggested by keyword: "
+            + ", ".join(
+                f"**{p['name']}** ({', '.join(p['_matched'][:3])})" for p in shortlist[:3]
+            )
+        )
+
+    chosen = st.multiselect(
+        "Link this conversation to",
+        list(labels),
+        default=[label for label, pid in labels.items() if pid in coverage],
+        key=f"projlink_{conv_id}",
+        help="Suggested projects are listed first in the caption above. Max "
+        f"{project_db.MAX_CONFIRMED_PER_ENTITY} confirmed projects per email.",
+    )
+    chosen_ids = {labels[label] for label in chosen}
+
+    act_col, new_col = st.columns([1, 2])
+    if act_col.button("Apply projects", key=f"projapply_{conv_id}"):
+        errors = []
+        for project_id in chosen_ids - set(coverage):
+            for message_id in message_ids:
+                try:
+                    project_db.link(
+                        project_id, "email", message_id, state="confirmed",
+                        rationale=f"Linked by hand from the thread {subject!r}.",
+                        assigned_by="user",
+                    )
+                except project_db.ProjectError as exc:
+                    errors.append(str(exc))
+                    break
+        for project_id in set(coverage) - chosen_ids:
+            for message_id in message_ids:
+                project_db.unlink(project_id, "email", message_id)
+        if errors:
+            st.error(errors[0])
+        else:
+            st.rerun()
+
+    with new_col.form(f"projnew_{conv_id}", clear_on_submit=True):
+        new_name = st.text_input(
+            "…or create a new project from this thread",
+            placeholder=subject[:60],
+            label_visibility="collapsed",
+        )
+        if st.form_submit_button("Create & link"):
+            typed = (new_name or "").strip() or subject
+            try:
+                # resolve_name first, so typing the name of something that
+                # already exists links it instead of erroring. Creation stays a
+                # human act either way — the LLM never reaches this path.
+                existing = project_db.resolve_name(typed)
+                project_id = existing or project_db.create_project(typed)
+                for message_id in message_ids:
+                    project_db.link(
+                        project_id, "email", message_id, state="confirmed",
+                        rationale=f"Created from the thread {subject!r}.",
+                        assigned_by="user",
+                    )
+                st.success(
+                    f"{'Linked to' if existing else 'Created'} {project_id}."
+                )
+                st.rerun()
+            except project_db.ProjectError as exc:
+                st.error(str(exc))
 
 
 tab_identify, tab_tracker, tab_projects, tab_ship = st.tabs(
@@ -262,6 +375,13 @@ with tab_identify:
                         msg.get("receivedDateTime", ""),
                         summary,
                     )
+                    # Dual-write into the project register. Nothing regresses:
+                    # the legacy label above is still the source for the Projects
+                    # & Themes view across every historical email, and this only
+                    # adds a link when the label IS a registered project. The
+                    # LLM is not proposing here — an exact name/alias match is a
+                    # deterministic identity, so it confirms directly.
+                    project_db.link_legacy_label(project, "email", mid)
 
                     # Shipment detection: upsert (merge) by tracking number.
                     ship = out.get("shipment")
@@ -448,6 +568,20 @@ with tab_identify:
                             )
                         st.rerun()
 
+                    st.divider()
+                    _render_project_controls(
+                        conv_id,
+                        c["subject"],
+                        " ".join(
+                            str(part)
+                            for part in (
+                                s.get("summary", ""),
+                                " ".join(s.get("key_points", []) or []),
+                            )
+                        ),
+                        c["message_ids"],
+                    )
+
 # --------------------------------------------------------------------------- #
 # 2. Email Action Tracker
 # --------------------------------------------------------------------------- #
@@ -601,6 +735,46 @@ with tab_projects:
         "work is repetitive vs. prior emails."
     )
 
+    # --- Register rollup ------------------------------------------------- #
+    # The PROJECT register, counted by linked email. Shown above the legacy
+    # label view rather than replacing it: the labels still cover every
+    # historical email, and cutting over would blank most of this tab.
+    register_counts = project_db.link_counts("confirmed")
+    register_rows = [
+        {
+            "ID": proj["project_id"],
+            "Project": proj["name"],
+            "Emails": register_counts.get(proj["project_id"], {}).get("email", 0),
+            "Keywords": proj["keywords"] or "—",
+        }
+        for proj in project_db.list_projects()
+    ]
+    if register_rows:
+        st.markdown("**Project register**")
+        st.dataframe(
+            pd.DataFrame(sorted(register_rows, key=lambda r: -r["Emails"])),
+            width="stretch",
+            hide_index=True,
+        )
+        pending_n = len(project_db.pending_proposals())
+        if pending_n:
+            st.caption(
+                f"{pending_n} project link(s) awaiting approval — review them in "
+                f"**Project Management → Proposals**."
+            )
+        st.caption(
+            "Managed in **Project Management**. Emails link here as they are "
+            "analyzed, whenever their label matches a registered project."
+        )
+        st.divider()
+    else:
+        st.info(
+            "No projects in the register yet — create some in **Project "
+            "Management** and analyzed email will start rolling up here."
+        )
+        st.divider()
+
+    st.markdown("**Legacy free-text labels**")
     counts = email_db.get_project_counts()
     if not counts:
         st.info("No projects yet — analyze emails in the **🔍 Identify Actions** tab first.")

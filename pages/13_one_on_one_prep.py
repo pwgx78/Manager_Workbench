@@ -19,6 +19,7 @@ import config
 import store
 import email_db
 import one_on_one_db as OODB
+import project_db
 import jira_analysis as JA
 import llm_prompts as P
 from api_helpers import (
@@ -346,7 +347,16 @@ if st.button("Generate Prep-Doc", type="primary"):
         try:
             for m in fetch_emails_for_person(email, sdt, edt):
                 mid = m.get("id")
-                project = email_db.get_project_for_message(mid) or "Unassigned"
+                # An email can now sit in several projects, which the single
+                # `project` column here cannot hold — so the registered names
+                # are joined. The legacy Phase-0 label remains the fallback for
+                # the ~1,300 emails that predate the register.
+                registered = project_db.projects_for_entity("email", mid)
+                project = (
+                    " · ".join(p["name"] for p in registered)
+                    if registered
+                    else email_db.get_project_for_message(mid) or "Unassigned"
+                )
                 OODB.upsert_item(
                     member_name, "email", mid or _nid(m.get("subject"), m.get("received")),
                     project, m.get("subject", ""),
