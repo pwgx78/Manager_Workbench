@@ -11,6 +11,7 @@ in this module is invoked automatically by the LLM.
 """
 import io
 import re
+import time
 import urllib3
 
 import requests
@@ -18,6 +19,8 @@ import pandas as pd
 import docx
 import pptx
 from bs4 import BeautifulSoup
+
+from datetime import datetime, timedelta
 
 import config
 from ms_auth import get_ms_token
@@ -280,23 +283,114 @@ def fetch_mail_volume(folder, timestamp_field, start_iso, end_iso, page_cb=None)
     after each page so a long pull can show progress.
     """
     headers = _graph_headers()
-    url = (
-        f"{GRAPH_ROOT}/me/mailFolders/{folder}/messages?"
-        f"$select=id,subject,conversationId,from,sender,toRecipients,{timestamp_field}&"
-        f"$filter={timestamp_field} ge {start_iso} and {timestamp_field} lt {end_iso}&"
-        f"$orderby={timestamp_field} desc&$top=999"
-    )
     messages = []
-    while url:
-        response = requests.get(url, headers=headers, verify=False)
-        if response.status_code != 200:
-            raise RuntimeError(f"Graph API Error: {response.status_code} - {response.text}")
-        data = response.json()
-        messages.extend(data.get("value", []))
-        if page_cb:
-            page_cb(len(messages))
-        url = data.get("@odata.nextLink")
+    # Same treatment as the mailbox-wide fetch: no $orderby (the caller counts,
+    # it does not read in order), a modest page size, bounded windows, and
+    # retries — a folder-scoped query is cheaper but still times out on a wide
+    # range in a busy mailbox.
+    for window_start, window_end in _split_window(start_iso, end_iso):
+        url = (
+            f"{GRAPH_ROOT}/me/mailFolders/{folder}/messages?"
+            f"$select=id,subject,conversationId,from,sender,toRecipients,"
+            f"{timestamp_field}&"
+            f"$filter={timestamp_field} ge {window_start} and "
+            f"{timestamp_field} lt {window_end}&"
+            f"$top={VOLUME_PAGE_SIZE}"
+        )
+        while url:
+            data = _graph_get(url, headers).json()
+            messages.extend(data.get("value", []))
+            if page_cb:
+                page_cb(len(messages))
+            url = data.get("@odata.nextLink")
     return messages
+
+
+# --------------------------------------------------------------------------- #
+# Graph resilience
+#
+# A mailbox-wide query is expensive server-side, and Graph answers a request it
+# cannot serve in time with 502/504 rather than with a smaller page. These are
+# transient and a retry usually succeeds, so the volume fetches go through
+# _graph_get rather than a bare requests.get.
+#
+# 429 is throttling, not failure: Graph says when to come back in Retry-After
+# and that must be honoured, or retrying makes the throttle worse.
+# --------------------------------------------------------------------------- #
+GRAPH_RETRY_STATUS = frozenset({429, 500, 502, 503, 504})
+GRAPH_MAX_ATTEMPTS = 5
+GRAPH_MAX_BACKOFF = 30  # seconds
+
+# Page size for the volume fetches. Far below the documented ceiling of 1000
+# deliberately: the docs warn that large pages risk a gateway timeout, and a
+# mailbox-wide filter is exactly the query that trips it. More round trips is a
+# cheap price for a fetch that finishes.
+VOLUME_PAGE_SIZE = 200
+
+# Longest window sent to Graph in one query. A filter spanning years makes the
+# server scan the whole mailbox at once; bounded windows keep each request
+# small, and let a wide pull report progress instead of appearing to hang.
+VOLUME_WINDOW_DAYS = 30
+
+
+def _graph_get(url, headers=None, attempts=GRAPH_MAX_ATTEMPTS, allow_404=False):
+    """GET a Graph URL, retrying throttling and transient gateway errors.
+
+    Raises RuntimeError with the last response body once the attempts are used
+    up, or immediately for an error that retrying cannot fix (401, 403, 404).
+    With `allow_404`, a 404 returns None instead — some callers ask about things
+    that may legitimately not exist.
+    """
+    headers = headers or _graph_headers()
+    backoff = 2.0
+    response = None
+    for attempt in range(1, attempts + 1):
+        response = requests.get(url, headers=headers, verify=False)
+        if response.status_code == 200:
+            return response
+        if response.status_code == 404 and allow_404:
+            return None
+        if response.status_code not in GRAPH_RETRY_STATUS or attempt == attempts:
+            break
+        retry_after = response.headers.get("Retry-After", "")
+        try:
+            wait = float(retry_after)
+        except ValueError:
+            wait = backoff
+        time.sleep(min(wait, GRAPH_MAX_BACKOFF))
+        backoff = min(backoff * 2, GRAPH_MAX_BACKOFF)
+
+    status = response.status_code if response is not None else "no response"
+    body = (response.text or "")[:400] if response is not None else ""
+    hint = ""
+    if status in GRAPH_RETRY_STATUS:
+        hint = (
+            f" Graph kept returning {status} after {attempts} attempts — it is "
+            f"struggling with the size of this request. Try a narrower date "
+            f"range."
+        )
+    raise RuntimeError(f"Graph API Error: {status} - {body}{hint}")
+
+
+def _split_window(start_iso, end_iso, max_days=VOLUME_WINDOW_DAYS):
+    """Break an ISO window into consecutive sub-windows of at most `max_days`.
+
+    Yields (start, end) ISO pairs; `end` stays exclusive throughout, so the
+    sub-windows tile the range without overlapping or dropping a boundary.
+    """
+    start = datetime.strptime(start_iso[:10], "%Y-%m-%d")
+    end = datetime.strptime(end_iso[:10], "%Y-%m-%d")
+    if end <= start:
+        yield start_iso, end_iso
+        return
+    cursor = start
+    while cursor < end:
+        chunk_end = min(cursor + timedelta(days=max_days), end)
+        yield (
+            f"{cursor.strftime('%Y-%m-%d')}T00:00:00Z",
+            f"{chunk_end.strftime('%Y-%m-%d')}T00:00:00Z",
+        )
+        cursor = chunk_end
 
 
 def fetch_well_known_folder_id(well_known_name):
@@ -308,16 +402,11 @@ def fetch_well_known_folder_id(well_known_name):
     non-English mailbox. 404 is a legitimate answer — 'clutter' and the hidden
     failure folders do not exist in every mailbox.
     """
-    response = requests.get(
+    response = _graph_get(
         f"{GRAPH_ROOT}/me/mailFolders/{well_known_name}?$select=id",
-        headers=_graph_headers(),
-        verify=False,
+        allow_404=True,
     )
-    if response.status_code == 404:
-        return None
-    if response.status_code != 200:
-        raise RuntimeError(f"Graph API Error: {response.status_code} - {response.text}")
-    return response.json().get("id")
+    return response.json().get("id") if response is not None else None
 
 
 def fetch_mailbox_messages(timestamp_field, start_iso, end_iso, page_cb=None):
@@ -339,25 +428,26 @@ def fetch_mailbox_messages(timestamp_field, start_iso, end_iso, page_cb=None):
     multi-year pull practical.
     """
     headers = _graph_headers()
-    url = (
-        f"{GRAPH_ROOT}/me/messages?"
-        f"$select=id,subject,conversationId,from,sender,toRecipients,"
-        f"parentFolderId,{timestamp_field}&"
-        f"$filter={timestamp_field} ge {start_iso} and {timestamp_field} lt {end_iso}&"
-        # Graph requires every $orderby property to also appear in $filter, in
-        # the same order, or it answers InefficientFilter.
-        f"$orderby={timestamp_field} desc&$top=999"
-    )
     messages = []
-    while url:
-        response = requests.get(url, headers=headers, verify=False)
-        if response.status_code != 200:
-            raise RuntimeError(f"Graph API Error: {response.status_code} - {response.text}")
-        data = response.json()
-        messages.extend(data.get("value", []))
-        if page_cb:
-            page_cb(len(messages))
-        url = data.get("@odata.nextLink")
+    # No $orderby. Sorting a mailbox-wide filtered result is a large chunk of
+    # the server-side work that makes this query time out, and the caller is
+    # COUNTING — it buckets by timestamp itself, so the order Graph returns rows
+    # in is irrelevant.
+    for window_start, window_end in _split_window(start_iso, end_iso):
+        url = (
+            f"{GRAPH_ROOT}/me/messages?"
+            f"$select=id,subject,conversationId,from,sender,toRecipients,"
+            f"parentFolderId,{timestamp_field}&"
+            f"$filter={timestamp_field} ge {window_start} and "
+            f"{timestamp_field} lt {window_end}&"
+            f"$top={VOLUME_PAGE_SIZE}"
+        )
+        while url:
+            data = _graph_get(url, headers).json()
+            messages.extend(data.get("value", []))
+            if page_cb:
+                page_cb(len(messages))
+            url = data.get("@odata.nextLink")
     return messages
 
 

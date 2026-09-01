@@ -58,9 +58,10 @@ def main():
     if fatal:
         print(f"\nFAILED: {len(fatal)} undefined name(s) — these crash at runtime.")
         return 1
+    notes = len(warn) + len(other)
     print(
-        f"\nLINT PASSED — no undefined names."
-        + (f" ({len(warn) + len(other)} non-fatal note(s).)" if warn or other else "")
+        "\nLINT PASSED — no undefined names."
+        + (f" ({notes} non-fatal note(s).)" if notes else "")
     )
     return 0
 
