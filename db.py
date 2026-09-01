@@ -222,7 +222,6 @@ def migrate_legacy(project_root):
         return None
 
     summary = {"docs": {}, "tables": {}, "config": False}
-    found_legacy = False
 
     # --- Loose JSON documents --------------------------------------------- #
     for filename, key in LEGACY_JSON_FILES.items():
@@ -237,7 +236,6 @@ def migrate_legacy(project_root):
             continue
         set_doc(key, data)
         summary["docs"][key] = len(data) if isinstance(data, (list, dict)) else 1
-        found_legacy = True
         _retire(path)
 
     # --- app_config.json: team data -> profile, credential paths -> machine - #
@@ -264,7 +262,6 @@ def migrate_legacy(project_root):
                     machine[k] = legacy_cfg[k]
             user_profile.save_machine(machine)
             summary["config"] = True
-            found_legacy = True
             _retire(cfg_path)
             _retire(cfg_path + ".bak")
 
@@ -275,7 +272,6 @@ def migrate_legacy(project_root):
             continue
         moved = _attach_and_copy(path, tables)
         summary["tables"].update(moved)
-        found_legacy = True
         _retire(path)
         for sidecar in (path + "-wal", path + "-shm"):
             if os.path.exists(sidecar):

@@ -10,3 +10,6 @@ python-pptx>=0.6
 pypdf>=4.0
 plotly>=5.22
 urllib3>=2.0
+
+# Dev only: static checks (see test_lint.py). The app runs without it.
+pyflakes>=3.0

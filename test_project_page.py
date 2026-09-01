@@ -68,7 +68,7 @@ assert imported, "Import button not found"
 assert project_db.count_projects() == 9, project_db.count_projects()
 ids = [p["project_id"] for p in project_db.list_projects()]
 assert "FAB-001" in ids and "FAB-009" in ids, ids
-print(f"  PASS imported 9 projects: FAB-001 … FAB-009")
+print(f"  PASS imported {len(ids)} projects: {min(ids)} … {max(ids)}")
 assert project_db.has_absorbed_special_projects()
 print("  PASS absorption flagged, so the panel will not reappear")
 
