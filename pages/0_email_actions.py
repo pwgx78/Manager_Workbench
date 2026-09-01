@@ -724,6 +724,51 @@ with tab_tracker:
         st.success(msg)
         st.rerun()
 
+    # --- Clear the whole register ----------------------------------------- #
+    # Deliberately ALL rows, not the filtered view: "clear the register" meaning
+    # "clear the seven rows you can currently see" would be a nasty surprise.
+    # The save path above is the one that respects filters.
+    with st.expander("🗑️ Clear action register"):
+        if df.empty:
+            st.caption("The register is already empty.")
+        else:
+            st.caption(
+                f"Deletes all **{len(df)}** item(s) from the tracker, including "
+                f"any hidden by the filters above. This cannot be undone — the "
+                f"tracker is hand-curated, so download a copy first if in doubt."
+            )
+            st.download_button(
+                "⬇️ Download a copy (CSV)",
+                data=df.to_csv(index=False).encode("utf-8"),
+                file_name=f"email_action_tracker_{datetime.today():%Y-%m-%d}.csv",
+                mime="text/csv",
+                key="phase0_tracker_export",
+            )
+            st.caption(
+                "Conversation dispositions are separate and are left alone, so a "
+                "thread already marked *Add to Tracker* stays marked. Re-select "
+                "that disposition to file its action again."
+            )
+            confirmed = st.checkbox(
+                f"Yes, delete all {len(df)} item(s)",
+                key="phase0_tracker_clear_confirm",
+            )
+            # `and confirmed` is not redundant with `disabled=`. The disabled
+            # flag only stops the click in the browser; the handler must refuse
+            # on its own too, or the guard on an irreversible delete is purely
+            # presentational.
+            if (
+                st.button(
+                    "Clear register",
+                    disabled=not confirmed,
+                    key="phase0_tracker_clear",
+                )
+                and confirmed
+            ):
+                store.save_json(config.EMAIL_ACTIONS_KEY, [])
+                st.success(f"Cleared {len(df)} item(s) from the tracker.")
+                st.rerun()
+
 # --------------------------------------------------------------------------- #
 # 3. Projects & Themes
 # --------------------------------------------------------------------------- #
