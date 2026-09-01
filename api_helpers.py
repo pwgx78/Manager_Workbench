@@ -299,6 +299,68 @@ def fetch_mail_volume(folder, timestamp_field, start_iso, end_iso, page_cb=None)
     return messages
 
 
+def fetch_well_known_folder_id(well_known_name):
+    """The id of a well-known mail folder ('sentitems', 'junkemail', …), or None
+    if this mailbox has no such folder.
+
+    Addressed by well-known NAME rather than by matching displayName: display
+    names are localized and user-renameable, so name-matching breaks on a
+    non-English mailbox. 404 is a legitimate answer — 'clutter' and the hidden
+    failure folders do not exist in every mailbox.
+    """
+    response = requests.get(
+        f"{GRAPH_ROOT}/me/mailFolders/{well_known_name}?$select=id",
+        headers=_graph_headers(),
+        verify=False,
+    )
+    if response.status_code == 404:
+        return None
+    if response.status_code != 200:
+        raise RuntimeError(f"Graph API Error: {response.status_code} - {response.text}")
+    return response.json().get("id")
+
+
+def fetch_mailbox_messages(timestamp_field, start_iso, end_iso, page_cb=None):
+    """Fetch every message in the MAILBOX for a window — not just one folder.
+
+    This is what makes the volume count honest for a mailbox driven by rules:
+    /me/messages spans the whole mailbox (the Graph docs say "including the
+    Deleted Items and Clutter folders"), so mail a cloud-side rule filed into a
+    custom or nested folder is still counted. Scoping to /mailFolders/inbox
+    misses all of it.
+
+    `parentFolderId` comes back with each message so the caller can classify it
+    (see email_volume.classify). Enumerating folders and summing them would be
+    the obvious alternative and is worse: the folder list includes virtual mail
+    SEARCH folders, so any message a search folder matches would be counted
+    twice. A mailbox-wide query returns each message once.
+
+    `end_iso` is EXCLUSIVE. Bodies are never selected, which is what keeps a
+    multi-year pull practical.
+    """
+    headers = _graph_headers()
+    url = (
+        f"{GRAPH_ROOT}/me/messages?"
+        f"$select=id,subject,conversationId,from,sender,toRecipients,"
+        f"parentFolderId,{timestamp_field}&"
+        f"$filter={timestamp_field} ge {start_iso} and {timestamp_field} lt {end_iso}&"
+        # Graph requires every $orderby property to also appear in $filter, in
+        # the same order, or it answers InefficientFilter.
+        f"$orderby={timestamp_field} desc&$top=999"
+    )
+    messages = []
+    while url:
+        response = requests.get(url, headers=headers, verify=False)
+        if response.status_code != 200:
+            raise RuntimeError(f"Graph API Error: {response.status_code} - {response.text}")
+        data = response.json()
+        messages.extend(data.get("value", []))
+        if page_cb:
+            page_cb(len(messages))
+        url = data.get("@odata.nextLink")
+    return messages
+
+
 def search_emails_by_subject(subject, start_date, end_date, max_messages=15):
     """Search Outlook for messages whose subject matches a free-text topic within
     the date range. Used by the Executive Translator to scrub related email

@@ -22,7 +22,7 @@ TODAY = dt.date.today()
 
 
 def graph_msg(mid, ts, direction):
-    field = EV.FOLDERS[direction][1]
+    field = EV.TIMESTAMP_FIELD[direction]
     msg = {"id": mid, field: ts, "subject": f"subject {mid}", "conversationId": "c"}
     if direction == EV.RECEIVED:
         msg["from"] = {"emailAddress": {"name": "A Sender", "address": "s@x.com"}}
@@ -72,6 +72,24 @@ assert metrics.get("Received") == "42", metrics
 assert metrics.get("Sent") == "14", metrics
 assert metrics.get("Received per sent") == "3.0×", metrics
 ok(f"stat tiles read {metrics}")
+
+print("\n-- the stale-scope banner --")
+# The rows above were stored without marking the scope, i.e. exactly the state a
+# profile is in after upgrading from Inbox-only counting.
+assert not EV.scope_is_current()
+assert any("only the **Inbox** counted" in str(w.value) for w in at.warning), [
+    w.value for w in at.warning
+]
+ok("warns that stored Inbox-only data undercounts received mail")
+assert [b for b in at.button if b.key == "vol_rescope"]
+ok("offers a clear-and-start-again button")
+
+EV.mark_scope()
+at = run("volume tab after re-scoping")
+assert not any("only the **Inbox** counted" in str(w.value) for w in at.warning)
+ok("banner gone once the data was gathered under the current definition")
+assert not [b for b in at.button if b.key == "vol_rescope"]
+ok("...and so is the button")
 
 print("\n-- the figure itself --")
 import plotly.graph_objects as go  # noqa: E402

@@ -18,7 +18,7 @@ ok = lambda m: print("  PASS", m)
 
 def graph_msg(mid, ts, direction, subject="s", who="Someone", addr="a@b.com"):
     """A message shaped the way Graph returns it."""
-    field = EV.FOLDERS[direction][1]
+    field = EV.TIMESTAMP_FIELD[direction]
     msg = {"id": mid, field: ts, "subject": subject, "conversationId": f"c-{mid}"}
     if direction == EV.RECEIVED:
         msg["from"] = {"emailAddress": {"name": who, "address": addr}}

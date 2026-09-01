@@ -1066,9 +1066,11 @@ def _refresh_shipment_statuses(pairs):
 with tab_volume:
     st.subheader("Mail volume over time")
     st.caption(
-        "How much arrives versus how much goes out. **Received** is your Inbox "
-        "and **Sent** is Sent Items, so mail a rule files into a subfolder "
-        "before you see it is not counted as received."
+        "How much arrives versus how much goes out. **Received** counts your "
+        "whole mailbox — Inbox, Archive, Deleted Items and any folder your "
+        "rules file into, however deeply nested — so cloud-side rules don't "
+        "hide mail from the count. Junk, Drafts and Teams chat history are not "
+        "counted. **Sent** is Sent Items."
     )
 
     _tz = "UTC"
@@ -1097,29 +1099,72 @@ with tab_volume:
     cov = EV.coverage()
     stored = cov[EV.RECEIVED]["count"] + cov[EV.SENT]["count"]
 
+    # Rows gathered before received mail was read mailbox-wide undercount, and
+    # coverage() cannot tell which definition produced which row — so blending
+    # them would quietly mix an accurate month with a short one. Rebuilding is
+    # just a Graph pull, so offer the unambiguous fix.
+    if stored and not EV.scope_is_current():
+        st.warning(
+            "This stored data was gathered when only the **Inbox** counted as "
+            "received, so anything your rules filed elsewhere is missing and "
+            "the received numbers are too low. Clear it and fetch again to "
+            "correct them."
+        )
+        if st.button("Clear and start again", key="vol_rescope"):
+            EV.clear()
+            st.rerun()
+
     fetch_col, stored_col = st.columns([1, 3])
     if fetch_col.button("🔄 Fetch this range", type="primary", key="vol_fetch"):
         if vol_start > vol_end:
             st.error("`From` is after `To` — nothing to fetch.")
         else:
             progress = st.empty()
+            window = (
+                f"{vol_start.isoformat()}T00:00:00Z",
+                f"{vol_end_exclusive.isoformat()}T00:00:00Z",
+            )
             try:
-                total = 0
-                for direction in EV.DIRECTIONS:
-                    folder, field = EV.FOLDERS[direction]
-                    progress.caption(f"Fetching {direction} mail…")
-                    messages = fetch_mail_volume(
-                        folder,
-                        field,
-                        f"{vol_start.isoformat()}T00:00:00Z",
-                        f"{vol_end_exclusive.isoformat()}T00:00:00Z",
-                        page_cb=lambda n, d=direction: progress.caption(
-                            f"Fetching {d} mail… {n:,} so far"
-                        ),
-                    )
-                    total += EV.upsert_messages(messages, direction)
+                progress.caption("Identifying your mail folders…")
+                ids = EV.folder_ids()
+
+                # Received: the whole mailbox, classified by parent folder.
+                progress.caption("Fetching received mail…")
+                inbound = fetch_mailbox_messages(
+                    EV.TIMESTAMP_FIELD[EV.RECEIVED],
+                    *window,
+                    page_cb=lambda n: progress.caption(
+                        f"Fetching received mail… {n:,} so far"
+                    ),
+                )
+                n_recv, n_ignored, _n_sent_skipped = EV.upsert_mailbox_messages(
+                    inbound, ids
+                )
+
+                # Sent: its own pass, because only Sent Items carries the
+                # sentDateTime that a sent message should be dated by.
+                progress.caption("Fetching sent mail…")
+                outbound = fetch_mail_volume(
+                    EV.SENT_FOLDER,
+                    EV.TIMESTAMP_FIELD[EV.SENT],
+                    *window,
+                    page_cb=lambda n: progress.caption(
+                        f"Fetching sent mail… {n:,} so far"
+                    ),
+                )
+                n_sent = EV.upsert_messages(outbound, EV.SENT)
+
+                EV.mark_scope()
                 progress.empty()
-                st.success(f"Stored {total:,} message(s). Re-fetching is safe.")
+                st.success(
+                    f"Stored {n_recv:,} received and {n_sent:,} sent."
+                    + (
+                        f" Skipped {n_ignored:,} in junk, drafts and chat history."
+                        if n_ignored
+                        else ""
+                    )
+                    + " Re-fetching is safe."
+                )
                 st.rerun()
             except Exception as e:
                 progress.empty()
@@ -1142,6 +1187,15 @@ with tab_volume:
                 "so the chart is instant. Fetch again to extend or refresh a "
                 "range — it is idempotent, so nothing double-counts."
             )
+            _ids = EV.cached_folder_ids()
+            if _ids:
+                st.caption(
+                    "Counted as received: the whole mailbox except junk, drafts, "
+                    "outbox and chat history — including "
+                    + ", ".join(EV.counted_folder_names(_ids))
+                    + ". Deleted Items is purged by retention over time, so the "
+                    "deep past will drift downward."
+                )
             if st.button("Clear stored volume data", key="vol_clear"):
                 EV.clear()
                 st.rerun()
