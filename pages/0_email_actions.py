@@ -16,12 +16,20 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import streamlit as st
 
+import plotly.graph_objects as go
+
 import config
 import store
 import email_db
+import email_volume as EV
 import llm_prompts as P
 import project_db
-from api_helpers import fetch_recent_inbox, clean_html, fetch_carrier_tracking_text
+from api_helpers import (
+    fetch_recent_inbox,
+    clean_html,
+    fetch_carrier_tracking_text,
+    fetch_mail_volume,
+)
 
 st.header("📥 Email Action Identifier")
 st.caption(
@@ -244,8 +252,131 @@ def _render_project_controls(conv_id, subject, summary_text, message_ids):
                 st.error(str(exc))
 
 
-tab_identify, tab_tracker, tab_projects, tab_ship = st.tabs(
-    ["🔍 Identify Actions", "📋 Email Action Tracker", "🗂️ Projects & Themes", "📦 Shipments"]
+# --------------------------------------------------------------------------- #
+# Mail volume chart
+#
+# Colors are categorical slots 1 and 2 (blue / orange) from the validated
+# palette, with steps chosen per mode rather than flipped: dark mode is its own
+# selection. The pair clears every gate in both modes — worst CVD Delta E 24.7
+# light / 26.8 dark against an 8.0 target, normal-vision 33.6 / 31.8 against a
+# 15.0 floor, and both above 3:1 contrast on their surface.
+# --------------------------------------------------------------------------- #
+SERIES_COLORS = {
+    "light": {EV.RECEIVED: "#2a78d6", EV.SENT: "#eb6834"},
+    "dark": {EV.RECEIVED: "#3987e5", EV.SENT: "#d95926"},
+}
+SERIES_LABEL = {EV.RECEIVED: "Received", EV.SENT: "Sent"}
+# Grid and axis text: one step off the surface, recessive, never the data color.
+CHROME = {
+    "light": {"grid": "#e6e5e2", "text": "#52514e"},
+    "dark": {"grid": "#33322f", "text": "#c3c2b7"},
+}
+
+
+def _theme_mode():
+    """'light' or 'dark' for the viewer's Streamlit theme. Defaults to light
+    when the theme is unknown (bare/headless runs report None)."""
+    try:
+        return "dark" if (st.context.theme or {}).get("type") == "dark" else "light"
+    except Exception:
+        return "light"
+
+
+def _volume_figure(frame, mode, grain):
+    """Clustered column chart of received vs sent per time bucket.
+
+    One chart with two series rather than two charts: both are counts of email,
+    so they share a scale honestly and the comparison is the point. (Two
+    different scales would have to be two charts — a second y-axis would invent
+    a relationship that isn't in the data.)
+
+    The x axis is categorical, not temporal: clustered columns want evenly
+    spaced slots, and a temporal axis would size February's column differently
+    from January's.
+    """
+    colors = SERIES_COLORS[mode]
+    chrome = CHROME[mode]
+    buckets = list(dict.fromkeys(frame["bucket_label"]))
+
+    figure = go.Figure()
+    for direction in EV.DIRECTIONS:
+        part = frame[frame["direction"] == direction]
+        figure.add_bar(
+            x=part["bucket_label"],
+            y=part["count"],
+            name=SERIES_LABEL[direction],
+            marker=dict(color=colors[direction], cornerradius=4),
+            # The tooltip carries the UNABBREVIATED bucket, so the terse axis
+            # tick never leaves a value ambiguous.
+            customdata=part["bucket_label"],
+            hovertemplate=(
+                f"<b>{SERIES_LABEL[direction]}</b><br>"
+                "%{customdata}<br>%{y:,} email(s)<extra></extra>"
+            ),
+        )
+
+    # Keep columns slim instead of letting them fill the slot. Plotly gaps are
+    # fractions of the slot, not pixels, so cap the bar at roughly 24px by
+    # solving for the gap at an assumed ~720px plot width: with two bars per
+    # slot, bar_px = slot_px * (1 - bargap) / 2. Few buckets therefore get a
+    # wide gap (air) rather than two fat blocks.
+    slot_px = 720 / max(len(buckets), 1)
+    bargap = 1 - (2 * 24) / slot_px if slot_px > 0 else 0.3
+    figure.update_layout(
+        barmode="group",
+        bargap=min(0.85, max(0.2, bargap)),
+        bargroupgap=0.08,  # the surface gap between the two clustered columns
+        height=420,
+        margin=dict(l=8, r=8, t=8, b=8),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=chrome["text"]),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0,
+            title_text="",
+        ),
+        hovermode="closest",
+    )
+    # Terse tick text ("03 Aug") against the full bucket key underneath: the
+    # filter row above already states the year, and full ISO dates rotated -45
+    # were eating a quarter of the figure height. The full form stays in the
+    # tooltip and the table.
+    ticks = frame.drop_duplicates("bucket_label")
+    figure.update_xaxes(
+        type="category",
+        categoryorder="array",
+        categoryarray=buckets,
+        tickmode="array",
+        tickvals=ticks["bucket_label"],
+        ticktext=ticks["tick_label"],
+        showgrid=False,
+        showline=True,
+        linecolor=chrome["grid"],
+        linewidth=1,
+        tickangle=-45 if len(buckets) > 8 else 0,
+        title_text="",
+    )
+    figure.update_yaxes(
+        showgrid=True,
+        gridcolor=chrome["grid"],
+        gridwidth=1,
+        griddash="solid",
+        zeroline=False,
+        rangemode="tozero",
+        separatethousands=True,
+        title_text="",
+    )
+    return figure
+
+
+tab_identify, tab_tracker, tab_projects, tab_volume, tab_ship = st.tabs(
+    [
+        "🔍 Identify Actions",
+        "📋 Email Action Tracker",
+        "🗂️ Projects & Themes",
+        "📈 Volume",
+        "📦 Shipments",
+    ]
 )
 
 # --------------------------------------------------------------------------- #
@@ -929,6 +1060,174 @@ def _refresh_shipment_statuses(pairs):
         email_db.update_shipment_status(tn, status)
 
 
+# --------------------------------------------------------------------------- #
+# 4. Volume
+# --------------------------------------------------------------------------- #
+with tab_volume:
+    st.subheader("Mail volume over time")
+    st.caption(
+        "How much arrives versus how much goes out. **Received** is your Inbox "
+        "and **Sent** is Sent Items, so mail a rule files into a subfolder "
+        "before you see it is not counted as received."
+    )
+
+    _tz = "UTC"
+    try:
+        _tz = st.context.timezone or "UTC"
+    except Exception:
+        pass
+    _mode = _theme_mode()
+
+    # One filter row above everything it scopes, so the tiles, the chart and the
+    # table all describe the same slice.
+    f1, f2, f3 = st.columns(3)
+    vol_start = f1.date_input(
+        "From", value=datetime.today().date() - timedelta(days=29), key="vol_start"
+    )
+    vol_end = f2.date_input("To", value=datetime.today().date(), key="vol_end")
+    grain = f3.selectbox(
+        "Group by",
+        list(EV.GRAINS),
+        index=list(EV.GRAINS).index(EV.DEFAULT_GRAIN),
+        key="vol_grain",
+    )
+    # `To` is inclusive to the user; the data layer takes an exclusive end.
+    vol_end_exclusive = vol_end + timedelta(days=1)
+
+    cov = EV.coverage()
+    stored = cov[EV.RECEIVED]["count"] + cov[EV.SENT]["count"]
+
+    fetch_col, stored_col = st.columns([1, 3])
+    if fetch_col.button("🔄 Fetch this range", type="primary", key="vol_fetch"):
+        if vol_start > vol_end:
+            st.error("`From` is after `To` — nothing to fetch.")
+        else:
+            progress = st.empty()
+            try:
+                total = 0
+                for direction in EV.DIRECTIONS:
+                    folder, field = EV.FOLDERS[direction]
+                    progress.caption(f"Fetching {direction} mail…")
+                    messages = fetch_mail_volume(
+                        folder,
+                        field,
+                        f"{vol_start.isoformat()}T00:00:00Z",
+                        f"{vol_end_exclusive.isoformat()}T00:00:00Z",
+                        page_cb=lambda n, d=direction: progress.caption(
+                            f"Fetching {d} mail… {n:,} so far"
+                        ),
+                    )
+                    total += EV.upsert_messages(messages, direction)
+                progress.empty()
+                st.success(f"Stored {total:,} message(s). Re-fetching is safe.")
+                st.rerun()
+            except Exception as e:
+                progress.empty()
+                st.error(f"Could not fetch mail volume: {e}")
+
+    if stored:
+        with stored_col.expander("Stored data"):
+            for direction in EV.DIRECTIONS:
+                info = cov[direction]
+                st.caption(
+                    f"**{SERIES_LABEL[direction]}**: {info['count']:,} message(s)"
+                    + (
+                        f" · {(info['first'] or '')[:10]} to {(info['last'] or '')[:10]}"
+                        if info["count"]
+                        else ""
+                    )
+                )
+            st.caption(
+                "Counts are read from this stored copy rather than from Outlook, "
+                "so the chart is instant. Fetch again to extend or refresh a "
+                "range — it is idempotent, so nothing double-counts."
+            )
+            if st.button("Clear stored volume data", key="vol_clear"):
+                EV.clear()
+                st.rerun()
+
+    if not stored:
+        st.info(
+            "No volume data yet — pick a range and press **Fetch this range**. "
+            "Only timestamps, subjects and senders are pulled, never message "
+            "bodies, so a wide range is quick."
+        )
+    else:
+        frame = None
+        try:
+            frame = EV.series(
+                start=vol_start.isoformat(),
+                end=vol_end_exclusive.isoformat(),
+                grain=grain,
+                tz=_tz,
+            )
+        except EV.TooManyBuckets as e:
+            st.warning(str(e))
+
+        if frame is not None and frame.empty:
+            st.info(
+                "Nothing stored for that range yet — press **Fetch this range**."
+            )
+        elif frame is not None:
+            counts = EV.totals(
+                start=vol_start.isoformat(), end=vol_end_exclusive.isoformat(), tz=_tz
+            )
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Received", f"{counts[EV.RECEIVED]:,}")
+            m2.metric("Sent", f"{counts[EV.SENT]:,}")
+            m3.metric(
+                "Received per sent",
+                f"{counts[EV.RECEIVED] / counts[EV.SENT]:.1f}×"
+                if counts[EV.SENT]
+                else "—",
+                help="How many arrive for every one you send.",
+            )
+
+            n_buckets = frame["bucket_label"].nunique()
+            if n_buckets > EV.BUSY_BUCKETS:
+                st.caption(
+                    f"{n_buckets:,} columns — readable, but crowded. A coarser "
+                    f"**Group by** will make the shape clearer."
+                )
+            st.plotly_chart(
+                _volume_figure(frame, _mode, grain),
+                width="stretch",
+                key=f"vol_chart_{grain}_{n_buckets}",
+            )
+            st.caption(f"Times shown in **{_tz}**.")
+
+            # Table view: every value the chart encodes, reachable without
+            # relying on hover or on telling two colours apart.
+            with st.expander("🔢 Table view"):
+                wide = (
+                    frame.pivot_table(
+                        index="bucket_label",
+                        columns="direction",
+                        values="count",
+                        aggfunc="sum",
+                        fill_value=0,
+                    )
+                    .rename(columns=SERIES_LABEL)
+                    .reset_index()
+                    .rename(columns={"bucket_label": grain})
+                )
+                for column in SERIES_LABEL.values():
+                    if column not in wide.columns:
+                        wide[column] = 0
+                wide["Total"] = wide[list(SERIES_LABEL.values())].sum(axis=1)
+                st.dataframe(wide, width="stretch", hide_index=True)
+                st.download_button(
+                    "⬇️ Download CSV",
+                    data=wide.to_csv(index=False).encode("utf-8"),
+                    file_name=f"mail_volume_by_{grain.lower()}.csv",
+                    mime="text/csv",
+                    key="vol_export",
+                )
+
+
+# --------------------------------------------------------------------------- #
+# 5. Shipments
+# --------------------------------------------------------------------------- #
 with tab_ship:
     st.subheader("Shipping Sample Tracker")
     st.caption(

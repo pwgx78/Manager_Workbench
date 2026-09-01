@@ -265,6 +265,40 @@ def fetch_recent_inbox(since_iso):
     return messages
 
 
+def fetch_mail_volume(folder, timestamp_field, start_iso, end_iso, page_cb=None):
+    """Fetch just enough of a mail folder to count it: ids, timestamps, subjects
+    and the counterparty. No bodies.
+
+    `folder` is a well-known folder id ('inbox' / 'sentitems') and
+    `timestamp_field` the one that matters for it ('receivedDateTime' /
+    'sentDateTime'). `end_iso` is EXCLUSIVE.
+
+    Bodies are the expensive part of a message, so omitting them is what makes a
+    multi-year volume pull practical — $top is raised to 999 for the same reason,
+    since counting a year of mail is thousands of records and the default page
+    size of 10 would be hundreds of round trips. `page_cb(n_so_far)` is called
+    after each page so a long pull can show progress.
+    """
+    headers = _graph_headers()
+    url = (
+        f"{GRAPH_ROOT}/me/mailFolders/{folder}/messages?"
+        f"$select=id,subject,conversationId,from,sender,toRecipients,{timestamp_field}&"
+        f"$filter={timestamp_field} ge {start_iso} and {timestamp_field} lt {end_iso}&"
+        f"$orderby={timestamp_field} desc&$top=999"
+    )
+    messages = []
+    while url:
+        response = requests.get(url, headers=headers, verify=False)
+        if response.status_code != 200:
+            raise RuntimeError(f"Graph API Error: {response.status_code} - {response.text}")
+        data = response.json()
+        messages.extend(data.get("value", []))
+        if page_cb:
+            page_cb(len(messages))
+        url = data.get("@odata.nextLink")
+    return messages
+
+
 def search_emails_by_subject(subject, start_date, end_date, max_messages=15):
     """Search Outlook for messages whose subject matches a free-text topic within
     the date range. Used by the Executive Translator to scrub related email

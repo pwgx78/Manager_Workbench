@@ -103,11 +103,13 @@ def init_schema():
     conn.close()
 
     import email_db
+    import email_volume
     import jira_db
     import one_on_one_db
     import project_db
 
     email_db.init_db()
+    email_volume.init_db()
     jira_db.init_db()
     one_on_one_db.init_db()
     project_db.init_db()
