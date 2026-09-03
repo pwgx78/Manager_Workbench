@@ -126,6 +126,46 @@ assert fresh != "FAB-001", fresh
 assert fresh == "FAB-004", fresh
 ok(f"next project is {fresh}, continuing the sequence rather than reusing FAB-001")
 
+print("\n-- opt-in renumbering, via the wipe checkbox --")
+seed()
+assert PDB.next_id_number() > 1
+at = run("wipe with renumber")
+widget(at, "checkbox", "wipe_sure").check().run()
+widget(at, "checkbox", "wipe_renumber").check().run()
+widget(at, "text_input", "wipe_typed").set_value("delete").run()
+widget(at, "button", "wipe_btn").click().run()
+assert PDB.count_projects(include_closed=True) == 0
+assert PDB.next_id_number() == 1, PDB.next_id_number()
+ok("ticking 'also restart numbering' resets the counter as part of the wipe")
+assert PDB.create_project("First Again") == "FAB-001"
+ok("...so the next project really is FAB-001")
+
+print("\n-- renumbering is refused while projects exist --")
+try:
+    PDB.reset_id_counter()
+    print("  FAIL renumbered with a project still present")
+    raise SystemExit(1)
+except PDB.ProjectError as exc:
+    ok(f"refused: {str(exc)[:58]}...")
+
+print("\n-- the standalone control for an already-empty register --")
+PDB.delete_all_projects()
+PDB.create_project("Bump the counter")
+PDB.delete_all_projects()          # empty register, counter left at 2
+assert PDB.next_id_number() == 3, PDB.next_id_number()
+at = run("empty register with a used counter")
+assert not [b for b in at.button if b.key == "wipe_btn"]
+ok("the danger zone is hidden (nothing to delete)...")
+widget(at, "button", "renumber_btn").click().run()
+assert PDB.next_id_number() == 1
+ok("...but a standalone renumber control is offered, and works")
+
+PDB.create_project("After Renumber")
+at = run("counter back at the start")
+assert not [b for b in at.button if b.key == "renumber_btn"]
+ok("the control disappears once numbering is already at the start")
+PDB.delete_all_projects()
+
 print("\n-- the legacy import is offered again --")
 PDB.delete_all_projects()
 config.save_special_projects([{"subject": "AI Gov", "keywords": ""}])

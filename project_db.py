@@ -224,6 +224,12 @@ def set_prefix(prefix):
     return cleaned
 
 
+def next_id_number():
+    """The number the next minted id would use. Read-only — for telling the
+    user what they would get before they commit to anything."""
+    return int(db.get_meta(COUNTER_KEY, "0") or 0) + 1
+
+
 def mint_project_id():
     """Return the next unused project id, e.g. 'FAB-007'.
 
@@ -478,6 +484,28 @@ def delete_all_projects():
     conn.commit()
     conn.close()
     return int(removed)
+
+
+def reset_id_counter():
+    """Restart id minting at 001.
+
+    Refused while any project exists. The counter's whole job is to stop a
+    number being reissued to different work, so restarting it is only coherent
+    on an empty register — with rows still present it would hand out ids that
+    are already taken (mint_project_id's uniqueness loop would silently skip
+    past them, which looks like the counter was ignored).
+
+    Deliberately a separate, explicitly-chosen step rather than something
+    delete_all_projects does on its own: wiping and renumbering are different
+    decisions, and the safe default is to keep ids unique forever.
+    """
+    if count_projects(include_closed=True):
+        raise ProjectError(
+            "Numbering can only be restarted while the register is empty — "
+            "otherwise the next id would collide with a project that already "
+            "has it."
+        )
+    db.set_meta(COUNTER_KEY, 0)
 
 
 def clear_absorbed_flag():

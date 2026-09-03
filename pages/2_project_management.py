@@ -509,6 +509,30 @@ with tab_register:
     # is a presentational guard rather than a real one.
     # ---------------------------------------------------------------------- #
     total_projects = project_db.count_projects(include_closed=True)
+
+    # An already-empty register hides the danger zone below, which would leave
+    # no route to a renumber for anyone who wiped first and decided afterwards.
+    if not total_projects and project_db.next_id_number() > 1:
+        st.divider()
+        with st.expander("🔢 Restart project numbering"):
+            st.caption(
+                f"The register is empty, but the next project would be "
+                f"**{project_db.get_prefix()}-"
+                f"{int(project_db.next_id_number()):03d}** because IDs are "
+                f"normally never reissued. Restarting is safe here: no project "
+                f"exists to collide with, and nothing is deleted — only future "
+                f"numbering changes."
+            )
+            if st.button("Restart numbering at 001", key="renumber_btn"):
+                try:
+                    project_db.reset_id_counter()
+                    st.success(
+                        f"The next project will be {project_db.get_prefix()}-001."
+                    )
+                    st.rerun()
+                except project_db.ProjectError as exc:
+                    _toast_error(exc)
+
     if total_projects:
         st.divider()
         with st.expander("🚨 Danger zone — delete ALL projects"):
@@ -518,15 +542,22 @@ with tab_register:
                 f"Jira. It cannot be undone."
             )
             st.caption(
-                "Project IDs continue from where they left off rather than "
-                "restarting at 001, so a number that has been used is never "
-                "reissued to different work. The legacy Special Projects import "
-                "will be offered again, since otherwise an emptied register has "
-                "no route back to the rows that seeded it."
+                "The legacy Special Projects import will be offered again, "
+                "since otherwise an emptied register has no route back to the "
+                "rows that seeded it."
             )
             wipe_sure = st.checkbox(
                 "Are you sure? This removes every project in the register.",
                 key="wipe_sure",
+            )
+            wipe_renumber = st.checkbox(
+                f"Also restart numbering at 001 "
+                f"(next project would otherwise be {project_db.get_prefix()}-"
+                f"{int(project_db.next_id_number()):03d})",
+                key="wipe_renumber",
+                help="Off by default: IDs are normally never reissued, so a "
+                "number that has been used cannot later point at different "
+                "work. Tick this only for a deliberate clean slate.",
             )
             wipe_typed = st.text_input(
                 "Type `delete` to confirm",
@@ -545,7 +576,12 @@ with tab_register:
             ):
                 removed = project_db.delete_all_projects()
                 project_db.clear_absorbed_flag()
-                st.success(f"Deleted all {removed} project(s).")
+                note = ""
+                if wipe_renumber:
+                    # After the wipe, so the empty-register precondition holds.
+                    project_db.reset_id_counter()
+                    note = f" Numbering restarts at {project_db.get_prefix()}-001."
+                st.success(f"Deleted all {removed} project(s).{note}")
                 st.rerun()
 
 # --------------------------------------------------------------------------- #
