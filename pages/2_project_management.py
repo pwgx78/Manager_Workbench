@@ -499,6 +499,55 @@ with tab_register:
                 st.success(f"Deleted {project_id}.")
                 st.rerun()
 
+    # ---------------------------------------------------------------------- #
+    # Danger zone — empty the whole register
+    #
+    # Sits inside a collapsed expander at the very bottom, below the per-project
+    # controls, so it is never adjacent to anything routine. Two independent
+    # confirmations are required, and the handler re-checks both: `disabled=`
+    # only stops the click in the browser, so on an irreversible bulk delete it
+    # is a presentational guard rather than a real one.
+    # ---------------------------------------------------------------------- #
+    total_projects = project_db.count_projects(include_closed=True)
+    if total_projects:
+        st.divider()
+        with st.expander("🚨 Danger zone — delete ALL projects"):
+            st.warning(
+                f"This deletes **all {total_projects} project(s)** — active and "
+                f"closed — along with every alias and every link to email and "
+                f"Jira. It cannot be undone."
+            )
+            st.caption(
+                "Project IDs continue from where they left off rather than "
+                "restarting at 001, so a number that has been used is never "
+                "reissued to different work. The legacy Special Projects import "
+                "will be offered again, since otherwise an emptied register has "
+                "no route back to the rows that seeded it."
+            )
+            wipe_sure = st.checkbox(
+                "Are you sure? This removes every project in the register.",
+                key="wipe_sure",
+            )
+            wipe_typed = st.text_input(
+                "Type `delete` to confirm",
+                key="wipe_typed",
+                placeholder="delete",
+                disabled=not wipe_sure,
+            )
+            wipe_ok = wipe_sure and wipe_typed.strip().lower() == "delete"
+            if (
+                st.button(
+                    f"Delete all {total_projects} project(s)",
+                    disabled=not wipe_ok,
+                    key="wipe_btn",
+                )
+                and wipe_ok
+            ):
+                removed = project_db.delete_all_projects()
+                project_db.clear_absorbed_flag()
+                st.success(f"Deleted all {removed} project(s).")
+                st.rerun()
+
 # --------------------------------------------------------------------------- #
 # Proposals — the P3 approval queue. Real, but nothing proposes into it yet.
 # --------------------------------------------------------------------------- #

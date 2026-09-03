@@ -456,6 +456,39 @@ def delete_project(project_id):
     conn.close()
 
 
+def delete_all_projects():
+    """Empty the register: every project, alias and link. Returns the number of
+    projects removed.
+
+    The id counter is deliberately NOT reset. It lives in profile_meta precisely
+    so a number is never reissued, and that holds just as much for wiping the
+    register as for deleting one row — anything outside the app that referred to
+    FAB-007 must not start resolving to a different project. The next project
+    after a wipe therefore continues the sequence rather than restarting at 001.
+
+    The three tables are cleared explicitly rather than leaning on ON DELETE
+    CASCADE: it is one statement each, it does not depend on the foreign-keys
+    pragma being on, and it makes the blast radius of this function readable.
+    """
+    conn = db.connect()
+    removed = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+    conn.execute("DELETE FROM project_links")
+    conn.execute("DELETE FROM project_aliases")
+    conn.execute("DELETE FROM projects")
+    conn.commit()
+    conn.close()
+    return int(removed)
+
+
+def clear_absorbed_flag():
+    """Forget that the legacy special_projects list was imported, so the seeding
+    offer comes back. Called after emptying the register: without it the user is
+    left with an empty register and no route back to the nine rows that seeded
+    it, which is a dead end. Importing is idempotent by name, so re-offering is
+    safe."""
+    db.set_meta(ABSORBED_KEY, "")
+
+
 # --------------------------------------------------------------------------- #
 # Aliases
 #
