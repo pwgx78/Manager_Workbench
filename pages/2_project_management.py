@@ -354,6 +354,101 @@ with tab_register:
                         project_db.remove_alias(drop)
                         st.rerun()
 
+        # --- Sub-projects -------------------------------------------------- #
+        # The level between this project and a single item: one Jira issue, or
+        # one email thread. Far thinner than a project on purpose — the key is
+        # the identity, so there is no ID to mint and no lifecycle beyond
+        # open/done.
+        with st.expander("🧩 Sub-projects"):
+            st.caption(
+                "A Jira issue or an email thread within this project. Jira "
+                "sub-projects register themselves when you link a ticket; "
+                "subject-based ones are added by hand, since a mailbox has "
+                "hundreds of subjects and auto-registering them would be noise."
+            )
+            subs = project_db.list_subprojects(project_id)
+            sub_counts = project_db.subproject_counts(project_id)
+            if not subs:
+                st.caption("None yet.")
+            else:
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Kind": sub["kind"],
+                                "Key": sub["label"] or sub["key"],
+                                "Status": sub["status"],
+                                "Added": sub["created_by"],
+                                **{
+                                    label: sub_counts.get(
+                                        (sub["kind"], sub["key"]), {}
+                                    ).get(entity, 0)
+                                    for entity, label in ENTITY_LABELS.items()
+                                },
+                            }
+                            for sub in subs
+                        ]
+                    ),
+                    width="stretch",
+                    hide_index=True,
+                )
+
+            add_col, manage_col = st.columns(2)
+            with add_col.form(f"sub_add_{project_id}", clear_on_submit=True):
+                st.markdown("**Add a sub-project**")
+                sub_kind = st.selectbox(
+                    "Type",
+                    project_db.SUBPROJECT_KINDS,
+                    format_func=lambda k: "Jira issue" if k == "jira" else "Email subject",
+                    key=f"subkind_{project_id}",
+                )
+                sub_key = st.text_input(
+                    "Jira key or email subject",
+                    placeholder="SPR-60789",
+                    key=f"subkey_{project_id}",
+                )
+                if st.form_submit_button("Add"):
+                    try:
+                        project_db.add_subproject(project_id, sub_kind, sub_key)
+                        st.rerun()
+                    except project_db.ProjectError as exc:
+                        _toast_error(exc)
+
+            if subs:
+                with manage_col.form(f"sub_manage_{project_id}"):
+                    st.markdown("**Change one**")
+                    choices = {
+                        f"{s['label'] or s['key']} ({s['status']})": s for s in subs
+                    }
+                    picked_label = st.selectbox(
+                        "Sub-project", list(choices), key=f"subpick_{project_id}"
+                    )
+                    picked = choices[picked_label]
+                    action = st.radio(
+                        "Action",
+                        ["Mark done", "Reopen", "Delete"],
+                        horizontal=True,
+                        key=f"subaction_{project_id}",
+                    )
+                    st.caption(
+                        "Deleting a sub-project leaves its emails and tickets "
+                        "linked to the project — they just stop being grouped "
+                        "under it."
+                    )
+                    if st.form_submit_button("Apply"):
+                        if action == "Delete":
+                            project_db.delete_subproject(
+                                project_id, picked["kind"], picked["key"]
+                            )
+                        else:
+                            project_db.set_subproject_status(
+                                project_id,
+                                picked["kind"],
+                                picked["key"],
+                                "done" if action == "Mark done" else "open",
+                            )
+                        st.rerun()
+
         # --- Linked items ------------------------------------------------- #
         with st.expander("🔗 Linked items"):
             links = project_db.links_for_project(project_id)

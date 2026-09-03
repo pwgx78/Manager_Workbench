@@ -137,6 +137,44 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_links_entity "
         "ON project_links (entity_type, entity_id, state)"
     )
+
+    # --- Sub-projects ---------------------------------------------------- #
+    # Deliberately far thinner than `projects`: the natural key IS the
+    # identity, so there is no minted id, no prefix, no counter, no aliases, no
+    # description and no proposals queue. Status is open/done rather than a
+    # close date. A sub-project cannot exist without a parent (the cascade
+    # enforces it), which is what keeps this from re-becoming the free-text
+    # label pile the register was built to escape.
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS subprojects (
+            project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+            kind       TEXT NOT NULL,
+            key        TEXT NOT NULL,
+            label      TEXT,
+            status     TEXT NOT NULL DEFAULT 'open',
+            created_by TEXT,
+            created_at TIMESTAMP,
+            PRIMARY KEY (project_id, kind, key)
+        )
+        """
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_subprojects_project "
+        "ON subprojects (project_id, status)"
+    )
+
+    # An existing link can be attributed to a sub-project. Nullable, so every
+    # link written before this existed stays valid and means "parent only" —
+    # which is why this is two added columns rather than a new join table.
+    existing = {row[1] for row in cursor.execute("PRAGMA table_info(project_links)")}
+    for column in ("subproject_kind", "subproject_key"):
+        if column not in existing:
+            cursor.execute(f"ALTER TABLE project_links ADD COLUMN {column} TEXT")
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_links_subproject "
+        "ON project_links (project_id, subproject_kind, subproject_key)"
+    )
     conn.commit()
     conn.close()
 
@@ -698,24 +736,44 @@ def link(
                 f"confirmed projects, which is the maximum."
             )
 
+    # Auto-register a sub-project for a Jira key, and attribute this link to
+    # it. Linking SPR-60789 to a project is already a statement that the ticket
+    # is part of that work, so making the sub-project a second manual step
+    # would be busywork.
+    #
+    # This is the ONE place creation is not a human act, and the exception is
+    # narrow by design: only entity_type='jira', only when the id really looks
+    # like a key, and the parent must already exist. There is no equivalent for
+    # email — a mailbox has hundreds of distinct subjects and auto-registering
+    # them would bury the list in noise.
+    auto_sub = None
+    if entity_type == JIRA and is_jira_key(entity_id):
+        auto_sub = normalize_subproject_key(JIRA, entity_id)
+        add_subproject(project_id, JIRA, entity_id, created_by="auto")
+
     stamp = _now()
     conn = db.connect()
     conn.execute(
         """
         INSERT INTO project_links (
             project_id, entity_type, entity_id, state, confidence, rationale,
-            assigned_by, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            assigned_by, created_at, updated_at, subproject_kind, subproject_key
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(project_id, entity_type, entity_id) DO UPDATE SET
             state       = excluded.state,
             confidence  = excluded.confidence,
             rationale   = excluded.rationale,
             assigned_by = excluded.assigned_by,
-            updated_at  = excluded.updated_at
+            updated_at  = excluded.updated_at,
+            -- COALESCE, not excluded: re-linking must not wipe an attribution
+            -- the user set by hand on this row.
+            subproject_kind = COALESCE(excluded.subproject_kind, project_links.subproject_kind),
+            subproject_key  = COALESCE(excluded.subproject_key,  project_links.subproject_key)
         """,
         (
             project_id, entity_type, str(entity_id), state,
             confidence, str(rationale or ""), assigned_by, stamp, stamp,
+            JIRA if auto_sub else None, auto_sub,
         ),
     )
     conn.commit()
@@ -824,6 +882,181 @@ def pending_proposals():
         "rationale", "created_at",
     )
     return [_row_to_dict(r, columns) for r in rows]
+
+
+# --------------------------------------------------------------------------- #
+# Sub-projects
+#
+# The level between a PROJECT and a single item. A project sits at the altitude
+# of a Jira PROJECT ('SPR'); a sub-project sits at the altitude of one Jira
+# ISSUE ('SPR-60789') or one email thread. That is the gap the Jira guard
+# creates on purpose: an issue must never become a top-level project, but it
+# still needs somewhere to live, and this is it.
+#
+# Kept deliberately thin — see the schema comment in init_db for what was left
+# out and why.
+# --------------------------------------------------------------------------- #
+JIRA, SUBJECT = "jira", "subject"
+SUBPROJECT_KINDS = (JIRA, SUBJECT)
+SUBPROJECT_STATUSES = ("open", "done")
+
+# Permissive about the prefix, strict about the tail. 'SPR-60789' is the common
+# case, but the real data also holds part numbers like 'CBL-EC5X-USBC3A-01', so
+# any number of hyphenated segments is allowed in front.
+#
+# The trailing '-<digits>' is what stops it matching ordinary hyphenated text:
+# without it, 'NOT-A-KEY-AT-ALL' is indistinguishable from a part number. Both
+# real forms end in a number; prose does not.
+_JIRA_KEY = re.compile(r"^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*-\d+$")
+
+# Reply/forward prefixes, stripped so 'RE: FW: TC101 issue' and 'TC101 issue'
+# are one sub-project rather than two.
+_REPLY_PREFIX = re.compile(r"^\s*((re|fw|fwd|aw|tr)\s*(\[\d+\])?\s*:\s*)+", re.I)
+
+
+def is_jira_key(text):
+    """True when `text` looks like a Jira issue key or part number."""
+    return bool(_JIRA_KEY.match(str(text or "").strip().upper()))
+
+
+def normalize_subproject_key(kind, raw):
+    """The stored identity for a sub-project key.
+
+    Jira keys are upper-cased and stripped. Subjects have reply/forward
+    prefixes removed and whitespace collapsed, but keep their punctuation and
+    words — unlike a project name, a subject needs to stay readable and
+    distinguishable, so the aggressive fold used for project names is wrong
+    here.
+    """
+    text = str(raw or "").strip()
+    if kind == JIRA:
+        return text.upper()
+    collapsed = " ".join(_REPLY_PREFIX.sub("", text).split())
+    return collapsed.casefold()
+
+
+def add_subproject(project_id, kind, raw_key, label=None, created_by="user"):
+    """Register a sub-project under a parent. Idempotent on its natural key.
+
+    Returns the stored key. Refuses a sub-project with no parent, which is the
+    invariant that stops these becoming standalone labels.
+    """
+    if kind not in SUBPROJECT_KINDS:
+        raise ProjectError(f"Unknown sub-project kind {kind!r}.")
+    key = normalize_subproject_key(kind, raw_key)
+    if not key:
+        raise ProjectError("A sub-project needs a Jira key or an email subject.")
+    if kind == JIRA and not is_jira_key(key):
+        raise ProjectError(
+            f"{key!r} does not look like a Jira key (expected something like "
+            f"SPR-60789)."
+        )
+    if not get_project(project_id):
+        raise ProjectError(
+            f"{project_id} does not exist — a sub-project must belong to a project."
+        )
+
+    display = str(label or "").strip() or (
+        str(raw_key).strip() if kind == JIRA else str(raw_key).strip()
+    )
+    conn = db.connect()
+    conn.execute(
+        """
+        INSERT INTO subprojects (
+            project_id, kind, key, label, status, created_by, created_at
+        ) VALUES (?, ?, ?, ?, 'open', ?, ?)
+        ON CONFLICT(project_id, kind, key) DO UPDATE SET
+            label = COALESCE(NULLIF(excluded.label, ''), subprojects.label)
+        """,
+        (project_id, kind, key, display, created_by, _now()),
+    )
+    conn.commit()
+    conn.close()
+    return key
+
+
+def list_subprojects(project_id, include_done=True):
+    """Sub-projects of one parent, open first then by key."""
+    where = ["project_id = ?"]
+    params = [project_id]
+    if not include_done:
+        where.append("status = 'open'")
+    columns = ("project_id", "kind", "key", "label", "status", "created_by", "created_at")
+    conn = db.connect()
+    rows = conn.execute(
+        f"SELECT {', '.join(columns)} FROM subprojects WHERE {' AND '.join(where)} "
+        f"ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, kind, key",
+        params,
+    ).fetchall()
+    conn.close()
+    return [_row_to_dict(r, columns) for r in rows]
+
+
+def set_subproject_status(project_id, kind, key, status):
+    if status not in SUBPROJECT_STATUSES:
+        raise ProjectError(f"Unknown status {status!r}.")
+    conn = db.connect()
+    conn.execute(
+        "UPDATE subprojects SET status = ? WHERE project_id = ? AND kind = ? AND key = ?",
+        (status, project_id, kind, key),
+    )
+    conn.commit()
+    conn.close()
+
+
+def delete_subproject(project_id, kind, key):
+    """Remove a sub-project. Any links attributed to it revert to parent-only
+    rather than being deleted — the email or ticket still belongs to the
+    project, it just no longer belongs to this sub-grouping."""
+    conn = db.connect()
+    conn.execute(
+        "UPDATE project_links SET subproject_kind = NULL, subproject_key = NULL "
+        "WHERE project_id = ? AND subproject_kind = ? AND subproject_key = ?",
+        (project_id, kind, key),
+    )
+    conn.execute(
+        "DELETE FROM subprojects WHERE project_id = ? AND kind = ? AND key = ?",
+        (project_id, kind, key),
+    )
+    conn.commit()
+    conn.close()
+
+
+def attribute_link(project_id, entity_type, entity_id, kind=None, key=None):
+    """Attribute an existing link to a sub-project, or clear it with kind=None.
+
+    The link still belongs to the parent project; this only says which
+    sub-grouping within it. That is what makes the roll-up work without a
+    second link table.
+    """
+    if kind is not None and kind not in SUBPROJECT_KINDS:
+        raise ProjectError(f"Unknown sub-project kind {kind!r}.")
+    stored = normalize_subproject_key(kind, key) if kind else None
+    conn = db.connect()
+    conn.execute(
+        "UPDATE project_links SET subproject_kind = ?, subproject_key = ?, "
+        "updated_at = ? WHERE project_id = ? AND entity_type = ? AND entity_id = ?",
+        (kind, stored, _now(), project_id, entity_type, str(entity_id)),
+    )
+    conn.commit()
+    conn.close()
+
+
+def subproject_counts(project_id, state="confirmed"):
+    """{(kind, key): {entity_type: n}} for one project's sub-projects."""
+    conn = db.connect()
+    rows = conn.execute(
+        "SELECT subproject_kind, subproject_key, entity_type, COUNT(*) "
+        "FROM project_links WHERE project_id = ? AND state = ? "
+        "AND subproject_key IS NOT NULL "
+        "GROUP BY subproject_kind, subproject_key, entity_type",
+        (project_id, state),
+    ).fetchall()
+    conn.close()
+    counts = {}
+    for kind, key, entity_type, total in rows:
+        counts.setdefault((kind, key), {})[entity_type] = int(total)
+    return counts
 
 
 # --------------------------------------------------------------------------- #
