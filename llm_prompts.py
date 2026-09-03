@@ -152,6 +152,12 @@ part numbers or lab minutiae unless they change the decision. Direct tone, no fl
 # --------------------------------------------------------------------------- #
 # Phase 0 — Email Action Identifier
 # --------------------------------------------------------------------------- #
+# Flat set, max 3 per email — mirrors project_db.MAX_CONFIRMED_PER_ENTITY.
+# Stated as a literal rather than imported: llm_prompts is imported by every
+# page and must not pull the project schema in behind it.
+MAX_PROJECT_CANDIDATES = 3
+
+
 def build_email_action_prompt(
     new_email_content,
     existing_context="",
@@ -159,6 +165,7 @@ def build_email_action_prompt(
     user_email=None,
     known_projects=None,
     team_context="",
+    project_candidates="",
 ):
     """Analyze a new email in the context of its thread and extract action
     items with Eisenhower prioritization, a suggested next step, a suggested
@@ -174,6 +181,43 @@ def build_email_action_prompt(
         if known_projects
         else "No known project names yet — assign a concise, reusable project name."
     )
+    # The register shortlist, keyword-pre-filtered before this call so prompt
+    # cost stays flat as the register grows. Ranking rides in THIS prompt rather
+    # than a second pass — that is what keeps the project feature at zero extra
+    # LLM calls. With no shortlist the whole task is omitted rather than asked
+    # and ignored, so nothing ever invites the model to invent an id.
+    candidate_block = (
+        "\n### CANDIDATE PROJECTS — the ONLY ids permitted in `project_candidates`\n"
+        + project_candidates
+        + "\n"
+        if project_candidates and project_candidates.strip()
+        else ""
+    )
+    candidate_task = (
+        f"""
+9. RANK PROJECTS: from the CANDIDATE PROJECTS list above, return up to
+   {MAX_PROJECT_CANDIDATES} that this email genuinely belongs to, best first, in
+   `project_candidates`.
+   - Use ONLY the ids shown in that list, copied EXACTLY. Never invent an id, a
+     name, or a project that is not listed.
+   - Judge on what the email is ABOUT, not on a keyword coincidence: the list was
+     built by crude string matching and WILL contain projects that do not fit.
+   - Return an EMPTY array if none genuinely fit. An empty array is the correct,
+     expected answer for generic or administrative email — it is not a failure.
+   - `confidence` is 0.0-1.0. `rationale` is one short clause naming the specific
+     evidence in the email.
+"""
+        if candidate_block
+        else ""
+    )
+    candidate_schema = (
+        """
+### `project_candidates` SCHEMA (array — empty array if none fit)
+[{{"project_id": "<exact id from CANDIDATE PROJECTS>", "confidence": 0.0, "rationale": "<why>"}}]
+"""
+        if candidate_block
+        else ""
+    )
     return f"""
 You are an expert email action analyzer for {user_name} (email: {user_email}).
 Analyze a NEW email within the context of its thread
@@ -184,7 +228,7 @@ them, the single best next step, a suggested response, and which project it belo
 {existing_context or "No history available for this thread."}
 
 ### {known_block}
-
+{candidate_block}
 ### NEW EMAIL CONTENT
 {new_email_content[:2500]}
 
@@ -206,9 +250,10 @@ them, the single best next step, a suggested response, and which project it belo
    `date_sent` (YYYY-MM-DD), `contents` (what's inside), `carrier` (FedEx | UPS | DHL |
    Other), `tracking_number`. Use "" for any field not stated. If the email is NOT
    about a shipment, set `shipment` to null.
-8. Format the ENTIRE response as a single valid JSON object with exactly four keys:
+8. Format the ENTIRE response as a single valid JSON object with these keys:
    `extracted_tasks` (array), `new_context_summary` (string), `Project` (string),
-   and `shipment` (object or null).
+   `shipment` (object or null){", and `project_candidates` (array)" if candidate_block else ""}.
+{candidate_task}
 
 ### STRICT OUTPUT SCHEMA (each item in `extracted_tasks`)
 {{
@@ -238,7 +283,7 @@ If there are no action items, return an empty `extracted_tasks` array (still set
   "associated_case": "", "associated_spr": "", "sender": "", "date_sent": "YYYY-MM-DD",
   "contents": "", "carrier": "FedEx | UPS | DHL | Other", "tracking_number": ""
 }}
-"""
+{candidate_schema}"""
 
 
 def build_thread_action_prompt(thread_block, team_context=""):

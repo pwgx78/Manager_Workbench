@@ -687,39 +687,128 @@ with tab_proposals:
     pending = project_db.pending_proposals()
     if not pending:
         st.info(
-            "Nothing awaiting approval. The Email Action Identifier starts "
-            "proposing projects in P3; until then, link items by hand from the "
-            "Register tab."
+            "Nothing awaiting approval. The Email Action Identifier proposes "
+            "projects as it analyzes mail — run it from the Email Action "
+            "Identifier page, or link items by hand from the Register tab."
         )
     else:
         st.caption(
-            f"{len(pending)} proposal(s). Approving links the item; rejecting is "
-            f"remembered, so the same wrong project is not proposed again."
+            f"{len(pending)} proposal(s) from the email analyzer. Approving links "
+            f"the item; **rejecting is remembered**, so the same wrong project is "
+            f"never proposed for that item again — which is why rejecting is "
+            f"worth doing rather than just leaving it."
         )
-        for row in pending:
-            with st.container(border=True):
-                head, approve, reject = st.columns([4, 1, 1])
-                head.markdown(
-                    f"**{row['project_id']} — {row['name']}** · "
-                    f"{row['entity_type']} `{row['entity_id']}`"
+
+        # Filters above the queue, so a big batch can be worked through one
+        # project or one confidence band at a time.
+        project_names = sorted({f"{p['project_id']} — {p['name']}" for p in pending})
+        f_proj, f_conf = st.columns([2, 1])
+        only_projects = f_proj.multiselect(
+            "Limit to project(s)", project_names, key="prop_filter_project"
+        )
+        min_conf = f_conf.slider(
+            "Minimum confidence", 0.0, 1.0, 0.0, 0.05, key="prop_filter_conf"
+        )
+        chosen_ids = {label.split(" — ")[0] for label in only_projects}
+        visible = [
+            row
+            for row in pending
+            if (not chosen_ids or row["project_id"] in chosen_ids)
+            and (row["confidence"] or 0.0) >= min_conf
+        ]
+        if len(visible) != len(pending):
+            st.caption(f"Showing {len(visible)} of {len(pending)}.")
+
+        if not visible:
+            st.info("No proposals match those filters.")
+        else:
+            # One editable Decision column beats a pair of buttons per row: a
+            # batch of eighty proposals is a table to work down, not eighty
+            # separate interactions. "Leave" is the default so nothing is
+            # decided by accident.
+            queue = pd.DataFrame(
+                [
+                    {
+                        "Decision": "Leave",
+                        "Project": f"{row['project_id']} — {row['name']}",
+                        "Type": row["entity_type"],
+                        "Item": row["entity_label"],
+                        "Confidence": row["confidence"],
+                        "Why": row["rationale"],
+                        "_pid": row["project_id"],
+                        "_etype": row["entity_type"],
+                        "_eid": row["entity_id"],
+                    }
+                    for row in visible
+                ]
+            )
+            edited = st.data_editor(
+                queue,
+                width="stretch",
+                hide_index=True,
+                key="prop_editor",
+                column_config={
+                    "Decision": st.column_config.SelectboxColumn(
+                        "Decision",
+                        options=["Leave", "Approve", "Reject"],
+                        required=True,
+                        width="small",
+                    ),
+                    "Confidence": st.column_config.NumberColumn(
+                        "Conf.", format="%.2f", width="small"
+                    ),
+                    "Item": st.column_config.TextColumn("Item", width="large"),
+                    "Why": st.column_config.TextColumn("Why", width="medium"),
+                    "_pid": None,
+                    "_etype": None,
+                    "_eid": None,
+                },
+                disabled=["Project", "Type", "Item", "Confidence", "Why"],
+            )
+
+            STATE = {"Approve": "confirmed", "Reject": "rejected"}
+            decisions = [
+                (r["_pid"], r["_etype"], r["_eid"], STATE[r["Decision"]])
+                for r in edited.to_dict("records")
+                if r["Decision"] in STATE
+            ]
+            apply_col, all_col = st.columns([1, 2])
+            if apply_col.button(
+                f"Apply {len(decisions)} decision(s)",
+                type="primary",
+                disabled=not decisions,
+                key="prop_apply",
+            ) and decisions:
+                applied, errors = project_db.decide_proposals(decisions)
+                for message in errors[:3]:
+                    st.error(message)
+                if applied:
+                    st.success(f"Applied {applied} decision(s).")
+                if not errors:
+                    st.rerun()
+
+            with all_col.expander(f"Decide all {len(visible)} shown at once"):
+                st.caption(
+                    "Applies to the filtered view above, not the whole queue. "
+                    "Approving in bulk can hit the "
+                    f"{project_db.MAX_CONFIRMED_PER_ENTITY}-project cap on an "
+                    "item; anything refused is reported rather than dropped."
                 )
-                if row["confidence"] is not None:
-                    head.caption(f"Confidence {row['confidence']:.2f}")
-                if row["rationale"]:
-                    head.caption(row["rationale"])
-                key = f"{row['project_id']}_{row['entity_type']}_{row['entity_id']}"
-                if approve.button("Approve", key=f"ok_{key}", type="primary"):
-                    try:
-                        project_db.set_link_state(
-                            row["project_id"], row["entity_type"],
-                            row["entity_id"], "confirmed",
-                        )
-                        st.rerun()
-                    except project_db.ProjectError as exc:
-                        _toast_error(exc)
-                if reject.button("Reject", key=f"no_{key}"):
-                    project_db.set_link_state(
-                        row["project_id"], row["entity_type"],
-                        row["entity_id"], "rejected",
+                bulk_a, bulk_r = st.columns(2)
+                if bulk_a.button("Approve all shown", key="prop_all_ok"):
+                    applied, errors = project_db.decide_proposals(
+                        [(r["project_id"], r["entity_type"], r["entity_id"], "confirmed")
+                         for r in visible]
                     )
+                    for message in errors[:5]:
+                        st.error(message)
+                    st.success(f"Approved {applied}.")
+                    if not errors:
+                        st.rerun()
+                if bulk_r.button("Reject all shown", key="prop_all_no"):
+                    applied, _ = project_db.decide_proposals(
+                        [(r["project_id"], r["entity_type"], r["entity_id"], "rejected")
+                         for r in visible]
+                    )
+                    st.success(f"Rejected {applied}.")
                     st.rerun()

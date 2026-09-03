@@ -56,6 +56,11 @@ TRACKER_COLUMNS = [
     "Suggested Response",
 ]
 
+# How many active projects are offered to the model per email. The plan's ~8:
+# big enough that the right project is nearly always present, small enough that
+# prompt cost stays flat however large the register grows.
+SHORTLIST_SIZE = 8
+
 QUADRANT_BADGE = {
     "Urgent": "🔴 Urgent",
     "Critical": "🟠 Critical",
@@ -420,7 +425,7 @@ with tab_identify:
             else:
                 all_tasks = []
                 by_conv = {}
-                n_cache = n_fresh = n_failed = 0
+                n_cache = n_fresh = n_failed = n_proposed = 0
                 known_projects = email_db.list_known_projects()
                 team_ctx = config.team_context_block()
 
@@ -469,6 +474,13 @@ with tab_identify:
                         content = (
                             f"From: {sender}\nTo: {to_field}\nSubject: {subject}\n\n{body}"
                         )
+                        # Keyword pre-filter, then the SAME call that already
+                        # runs. No second pass, so the register costs zero extra
+                        # LLM calls; the shortlist keeps prompt size flat as the
+                        # register grows instead of scaling with project count.
+                        shortlist = project_db.shortlist_for_text(
+                            f"{subject}\n{body}", limit=SHORTLIST_SIZE
+                        )
                         try:
                             text = P.generate(
                                 client,
@@ -477,10 +489,21 @@ with tab_identify:
                                     context,
                                     known_projects=known_projects,
                                     team_context=team_ctx,
+                                    project_candidates=project_db.candidate_block(
+                                        shortlist
+                                    ),
                                 ),
                                 temperature=0.2,
                             )
                             out = _parse_llm_json(text)
+                            # Remember which ids were OFFERED, so the validation
+                            # allowlist survives into the cached analysis. A
+                            # cached result replayed later must be checked
+                            # against the same shortlist it was produced from,
+                            # not against whatever the register holds today.
+                            out["_project_shortlist"] = [
+                                p["project_id"] for p in shortlist
+                            ]
                         except Exception:
                             n_failed += 1
                             progress.progress((idx + 1) / len(messages))
@@ -514,6 +537,23 @@ with tab_identify:
                     # LLM is not proposing here — an exact name/alias match is a
                     # deterministic identity, so it confirms directly.
                     project_db.link_legacy_label(project, "email", mid)
+
+                    # Proposals from the model's ranking. Runs on the cached
+                    # branch too, so a re-run replays proposals for free
+                    # instead of re-billing the email — decision 10 says an
+                    # analysis is never recomputed, and this respects that.
+                    #
+                    # accept_candidates is the boundary where an invented id
+                    # would otherwise become a row: the offered shortlist is
+                    # the allowlist, and anything outside it is dropped.
+                    accepted = project_db.accept_candidates(
+                        out.get("project_candidates"),
+                        out.get("_project_shortlist") or [],
+                    )
+                    if accepted:
+                        n_proposed += project_db.propose_candidates(
+                            "email", mid, accepted
+                        )
 
                     # Shipment detection: upsert (merge) by tracking number.
                     ship = out.get("shipment")
@@ -614,6 +654,8 @@ with tab_identify:
                     f"{n_cache} cached",
                     f"{n_fresh} fresh",
                 ]
+                if n_proposed:
+                    msg_bits.append(f"{n_proposed} project proposal(s) to approve")
                 if n_failed:
                     msg_bits.append(f"{n_failed} skipped (parse error)")
                 st.success("Analysis complete — " + ", ".join(msg_bits) + ".")

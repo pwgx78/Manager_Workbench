@@ -864,14 +864,24 @@ def link_counts(state="confirmed"):
 
 
 def pending_proposals():
-    """Every link still awaiting a human decision — the P3 approval queue. Read
-    here in P1 so the module can show an honest zero."""
+    """Every link still awaiting a human decision — the approval queue.
+
+    Carries `entity_label`: for email that is the subject line, joined from
+    email_projects. A raw Graph message id is unreadable, so approving against
+    one would be guesswork rather than judgement. Falls back to the id for
+    anything with no subject on record.
+    """
     conn = db.connect()
     rows = conn.execute(
         """
         SELECT l.project_id, p.name, l.entity_type, l.entity_id, l.confidence,
-               l.rationale, l.created_at
-        FROM project_links l JOIN projects p ON p.project_id = l.project_id
+               l.rationale, l.created_at,
+               COALESCE(NULLIF(e.subject, ''), l.entity_id) AS entity_label,
+               e.received
+        FROM project_links l
+        JOIN projects p ON p.project_id = l.project_id
+        LEFT JOIN email_projects e
+               ON l.entity_type = 'email' AND e.message_id = l.entity_id
         WHERE l.state = 'proposed'
         ORDER BY l.confidence DESC, l.created_at DESC
         """
@@ -879,9 +889,27 @@ def pending_proposals():
     conn.close()
     columns = (
         "project_id", "name", "entity_type", "entity_id", "confidence",
-        "rationale", "created_at",
+        "rationale", "created_at", "entity_label", "received",
     )
     return [_row_to_dict(r, columns) for r in rows]
+
+
+def decide_proposals(decisions):
+    """Apply a batch of approve/reject decisions.
+
+    `decisions` is an iterable of (project_id, entity_type, entity_id, state).
+    Returns (applied, errors) — errors are the human-readable refusals, most
+    commonly the three-confirmed cap being hit, which must be reported rather
+    than silently swallowed in a bulk operation.
+    """
+    applied, errors = 0, []
+    for project_id, entity_type, entity_id, state in decisions:
+        try:
+            set_link_state(project_id, entity_type, entity_id, state)
+            applied += 1
+        except ProjectError as exc:
+            errors.append(f"{project_id} / {entity_id}: {exc}")
+    return applied, errors
 
 
 # --------------------------------------------------------------------------- #
@@ -1143,6 +1171,90 @@ def shortlist_for_text(text, limit=8, include_scores=False):
 
     scored.sort(key=lambda item: (-item[0], item[1]))
     return [project for _score, _name, project in scored[:limit]]
+
+
+def accept_candidates(raw, shortlist, limit=MAX_CONFIRMED_PER_ENTITY):
+    """Filter a model's `project_candidates` down to what may actually be filed.
+
+    The model is asked to return only ids from the shortlist it was shown, but
+    "asked" is not "guaranteed", and this is the boundary where an invented id
+    would become a database row. So the shortlist is the allowlist: anything
+    outside it is dropped, no matter how confident the model sounded.
+
+    Also enforces the flat cap, coerces confidence into 0.0-1.0, and de-dupes —
+    a model that names the same project twice must not produce two proposals.
+
+    Returns [{"project_id", "confidence", "rationale"}], best first.
+    """
+    allowed = {
+        project["project_id"] if isinstance(project, dict) else project
+        for project in (shortlist or [])
+    }
+    if not isinstance(raw, list) or not allowed:
+        return []
+
+    accepted, seen = [], set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        project_id = str(item.get("project_id", "")).strip()
+        if project_id not in allowed or project_id in seen:
+            continue
+        try:
+            confidence = float(item.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        seen.add(project_id)
+        accepted.append(
+            {
+                "project_id": project_id,
+                "confidence": min(1.0, max(0.0, confidence)),
+                "rationale": str(item.get("rationale", "") or "").strip(),
+            }
+        )
+    accepted.sort(key=lambda c: -c["confidence"])
+    return accepted[:limit]
+
+
+def propose_candidates(entity_type, entity_id, candidates):
+    """File accepted candidates as PROPOSED links awaiting human approval.
+
+    Skips any project already confirmed or rejected for this entity: a decision
+    the user has already made must not be reopened by a later analysis, and a
+    project they rejected must stay rejected. That is the whole point of storing
+    rejections rather than deleting them.
+
+    Returns the number of new proposals written.
+    """
+    conn = db.connect()
+    decided = {
+        row[0]
+        for row in conn.execute(
+            "SELECT project_id FROM project_links WHERE entity_type = ? "
+            "AND entity_id = ? AND state IN ('confirmed', 'rejected')",
+            (entity_type, str(entity_id)),
+        )
+    }
+    conn.close()
+
+    written = 0
+    for candidate in candidates:
+        if candidate["project_id"] in decided:
+            continue
+        try:
+            link(
+                candidate["project_id"],
+                entity_type,
+                entity_id,
+                state="proposed",
+                confidence=candidate["confidence"],
+                rationale=candidate["rationale"],
+                assigned_by="llm",
+            )
+            written += 1
+        except ProjectError:
+            continue
+    return written
 
 
 def candidate_block(projects):
