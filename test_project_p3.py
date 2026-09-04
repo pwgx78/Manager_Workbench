@@ -46,6 +46,22 @@ assert "EMPTY array if none genuinely fit" in withc
 ok("an empty answer is explicitly framed as correct, not as failure")
 assert "keyword coincidence" in withc
 ok("the prompt warns the shortlist is crude and will contain non-fits")
+
+# The candidate schema is a plain string interpolated into an f-string, so
+# f-string brace escaping does NOT apply to it. Doubling its braces would show
+# the model `[{{...}}]` — malformed JSON as the example of the JSON it must
+# produce. This shipped broken once.
+schema_line = [
+    line for line in withc.splitlines()
+    if "project_id" in line and "confidence" in line and line.strip().startswith("[")
+]
+assert schema_line, "the project_candidates schema example is missing"
+assert "{{" not in schema_line[0] and "}}" not in schema_line[0], schema_line[0]
+ok(f"the schema example is valid JSON, not brace-escaped: {schema_line[0][:46]}...")
+import json as _json
+_probe = schema_line[0].replace("<exact id from CANDIDATE PROJECTS>", "FAB-001").replace("<why>", "w")
+assert isinstance(_json.loads(_probe), list)
+ok("...and it actually parses as JSON")
 assert P.MAX_PROJECT_CANDIDATES == PDB.MAX_CONFIRMED_PER_ENTITY == 3
 ok("the cap in the prompt matches the cap the database enforces")
 

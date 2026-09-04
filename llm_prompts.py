@@ -210,10 +210,15 @@ def build_email_action_prompt(
         if candidate_block
         else ""
     )
+    # SINGLE braces here, unlike the schema blocks written inline in the f-string
+    # below. This is a plain string that gets interpolated, and f-string brace
+    # escaping applies only to the literal parts of the f-string — doubling them
+    # here would send the model `[{{...}}]`, which is not the JSON it is being
+    # asked to produce.
     candidate_schema = (
         """
 ### `project_candidates` SCHEMA (array — empty array if none fit)
-[{{"project_id": "<exact id from CANDIDATE PROJECTS>", "confidence": 0.0, "rationale": "<why>"}}]
+[{"project_id": "<exact id from CANDIDATE PROJECTS>", "confidence": 0.0, "rationale": "<why>"}]
 """
         if candidate_block
         else ""
